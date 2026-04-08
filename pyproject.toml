@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "riverrater"
+version = "0.1.0"
+description = "Real-time casino game assistant with HUD overlay"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.9",
+    "mss>=9.0",
+    "PyQt6>=6.6",
+    "numpy>=1.26",
+    "pynput>=1.7",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.2",
+    "ultralytics>=8.1",
+]
+train = [
+    "torch>=2.2",
+    "ultralytics>=8.1",
+    "roboflow",
+    "albumentations",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.3",
+]
+
+[project.scripts]
+riverrater = "riverrater.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
