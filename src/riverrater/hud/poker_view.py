@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from riverrater.game.state import PokerAction, PokerResult
+from riverrater.game.state import DetectionMeta, PokerAction, PokerResult
 
 logger = logging.getLogger(__name__)
 
@@ -108,11 +108,37 @@ class PokerView(QWidget):
         )
         self._status_dot.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
+        self._confidence_dot = QLabel("●")
+        self._confidence_dot.setStyleSheet(
+            f"color: {_CLR_MUTED}; font-size: 9px;"
+        )
+        self._confidence_dot.hide()
+
         title_row.addWidget(self._title_label)
         title_row.addStretch()
+        title_row.addWidget(self._confidence_dot)
         title_row.addWidget(self._status_dot)
         root.addLayout(title_row)
         root.addWidget(_HRule(self))
+
+        # -- Card detection row (confidence display) -------------------------
+        self._card_detection_label = QLabel()
+        self._card_detection_label.setStyleSheet(
+            f"color: {_CLR_LIGHTGRAY}; font-family: {_MONO_FONT}; font-size: 11px;"
+        )
+        self._card_detection_label.setWordWrap(True)
+        self._card_detection_label.hide()
+        root.addWidget(self._card_detection_label)
+
+        # -- Low-confidence warning banner -----------------------------------
+        self._warning_label = QLabel("\u26a0 Low confidence \u2014 verify cards")
+        self._warning_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._warning_label.setStyleSheet(
+            f"color: {_CLR_YELLOW}; background-color: rgba(120,100,0,140);"
+            f" font-size: 11px; padding: 4px; border-radius: 4px;"
+        )
+        self._warning_label.hide()
+        root.addWidget(self._warning_label)
 
         # -- No-data placeholder ---------------------------------------------
         self._no_data_label = QLabel("Waiting for cards...")
@@ -228,6 +254,7 @@ class PokerView(QWidget):
             return
 
         self._show_data()
+        self._update_confidence(result.detection_meta)
 
         # Status dot → green when live
         self._status_dot.setStyleSheet(
@@ -281,8 +308,62 @@ class PokerView(QWidget):
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _update_confidence(self, meta: "DetectionMeta | None") -> None:
+        """Update confidence dot, card detection row, and warning banner."""
+        if meta is None:
+            self._confidence_dot.hide()
+            self._card_detection_label.hide()
+            self._warning_label.hide()
+            return
+
+        # Confidence dot color
+        if meta.overall_confidence >= 0.85:
+            dot_color = _CLR_GREEN
+        elif meta.overall_confidence >= 0.7:
+            dot_color = _CLR_YELLOW
+        else:
+            dot_color = _CLR_RED
+        self._confidence_dot.setStyleSheet(f"color: {dot_color}; font-size: 9px;")
+        self._confidence_dot.show()
+
+        # Card detection row
+        if meta.is_manual:
+            self._card_detection_label.setText("MANUAL \u2713")
+            self._card_detection_label.setStyleSheet(
+                f"color: {_CLR_MUTED}; font-family: {_MONO_FONT}; font-size: 11px;"
+            )
+            self._card_detection_label.show()
+            self._warning_label.hide()
+        elif meta.card_confidences:
+            parts = []
+            for card_str, conf in meta.card_confidences.items():
+                if conf >= 0.85:
+                    color = _CLR_GREEN
+                elif conf >= 0.7:
+                    color = _CLR_YELLOW
+                else:
+                    color = _CLR_RED
+                parts.append(
+                    f'<span style="color:{color}">{card_str} {conf * 100:.0f}%</span>'
+                )
+            self._card_detection_label.setText("  ".join(parts))
+            self._card_detection_label.setStyleSheet(
+                f"font-family: {_MONO_FONT}; font-size: 11px;"
+            )
+            self._card_detection_label.show()
+
+            # Warning banner — show if any card < 0.7
+            has_low = any(c < 0.7 for c in meta.card_confidences.values())
+            self._warning_label.setVisible(has_low)
+        else:
+            self._card_detection_label.hide()
+            self._warning_label.hide()
+
     def _show_no_data(self) -> None:
         self._status_dot.setStyleSheet(f"color: {_CLR_MUTED}; font-size: 9px;")
+        self._confidence_dot.hide()
+        self._card_detection_label.hide()
+        self._warning_label.hide()
         self._no_data_label.show()
         self._data_widget.hide()
 

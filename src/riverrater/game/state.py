@@ -134,6 +134,28 @@ class BlackjackState:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class DetectionMeta:
+    """Metadata about vision detection confidence."""
+    card_confidences: dict[str, float] = field(default_factory=dict)  # card_str -> confidence 0.0-1.0
+    overall_confidence: float = 0.0  # average of all card_confidences
+    is_manual: bool = False  # True when cards came from manual input
+
+    @classmethod
+    def from_detections(cls, detections: list[tuple]) -> "DetectionMeta":
+        """Build from TemplateEngine detection tuples (Card, bbox, confidence)."""
+        if not detections:
+            return cls()
+        confidences = {str(card): conf for card, _bbox, conf in detections}
+        avg = sum(confidences.values()) / len(confidences) if confidences else 0.0
+        return cls(card_confidences=confidences, overall_confidence=avg)
+
+    @classmethod
+    def manual(cls) -> "DetectionMeta":
+        """Create a DetectionMeta indicating manual input."""
+        return cls(overall_confidence=1.0, is_manual=True)
+
+
+@dataclass
 class PokerResult:
     win_pct: float = 0.0
     tie_pct: float = 0.0
@@ -143,6 +165,7 @@ class PokerResult:
     ev_fold: float = 0.0
     ev_raise: float = 0.0
     recommended_action: Optional[PokerAction] = None
+    detection_meta: Optional[DetectionMeta] = None
 
 
 @dataclass

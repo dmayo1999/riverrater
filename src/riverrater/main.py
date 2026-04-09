@@ -45,6 +45,7 @@ from riverrater.game.state import (
     BlackjackResult,
     BlackjackState,
     Card,
+    DetectionMeta,
     GameMode,
     PokerResult,
     PokerState,
@@ -75,6 +76,14 @@ except ImportError as _e:
     HUDOverlay = None  # type: ignore[assignment,misc]
     ManualCardInput = None  # type: ignore[assignment,misc]
     PokerInputDialog = None  # type: ignore[assignment,misc]
+
+try:
+    from riverrater.hud.calibration_overlay import CalibrationOverlay
+    _HAS_CALIBRATION = True
+except ImportError as _e:
+    logger.warning("calibration overlay not available: %s", _e)
+    _HAS_CALIBRATION = False
+    CalibrationOverlay = None  # type: ignore[assignment,misc]
 
 # -- Hotkeys -----------------------------------------------------------------
 from riverrater.utils.hotkeys import HotkeyManager
@@ -221,6 +230,9 @@ class GameController:
         self._frame_change_threshold: float = 5.0  # Mean pixel diff threshold
         self._detect_every_n: int = 3  # Run detection at most every N ticks
 
+        # Detection confidence metadata
+        self._detection_meta: Optional[DetectionMeta] = None
+
         # Stats
         self._frame_count: int = 0
 
@@ -272,6 +284,7 @@ class GameController:
                 self._apply_poker_detections(detections)
 
         result = analyze_poker(self.poker_state)
+        result.detection_meta = self._detection_meta
         self._last_poker_result = result
 
         if self.overlay is not None:
@@ -317,6 +330,7 @@ class GameController:
         Simple heuristic: first 2 detected cards → hole cards (if not already
         populated); remaining → community cards.
         """
+        self._detection_meta = DetectionMeta.from_detections(detections)
         cards = [card for card, _bbox, _conf in detections]
         if not cards:
             return
@@ -356,6 +370,8 @@ class GameController:
         if card is None:
             logger.warning("Cannot parse card string: %r", card_str)
             return
+
+        self._detection_meta = DetectionMeta.manual()
 
         if target == "player":
             if card not in self.blackjack_state.player_hand:
@@ -609,9 +625,39 @@ def main(argv: list[str] | None = None) -> int:
             QMetaObject.invokeMethod(overlay, "toggle_visibility", Qt.ConnectionType.QueuedConnection)
 
     def _calibrate() -> None:
-        logger.info(
-            "Calibration mode not yet wired — draw box in capture region"
-        )
+        if not _HAS_CALIBRATION or CalibrationOverlay is None:
+            logger.warning("Calibration overlay not available.")
+            return
+
+        def _calibrate_on_main_thread() -> None:
+            frame = capture.grab_frame() if hasattr(capture, "grab_frame") else capture.get_latest_frame()
+            if frame is None:
+                logger.warning("Cannot calibrate — no frame available.")
+                return
+
+            timer.stop()
+
+            profile_path = str(Path("~/.riverrater/profiles").expanduser() / config.vision_profile)
+
+            cal_overlay = CalibrationOverlay(
+                frame=frame,
+                template_engine=template_engine,
+                profile_path=profile_path,
+            )
+
+            def _on_cal_finished() -> None:
+                timer.start()
+                logger.info("Calibration complete — templates saved.")
+
+            def _on_cal_cancelled() -> None:
+                timer.start()
+                logger.info("Calibration cancelled.")
+
+            cal_overlay.calibration_finished.connect(_on_cal_finished)
+            cal_overlay.calibration_cancelled.connect(_on_cal_cancelled)
+            cal_overlay.show()
+
+        QTimer.singleShot(0, _calibrate_on_main_thread)
 
     def _show_manual_input() -> None:
         if manual_input is not None:
