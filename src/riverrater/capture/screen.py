@@ -243,40 +243,57 @@ class ScreenCapture:
             "height": clamped_height,
         }
 
-    def _capture_frame(self) -> np.ndarray:
+    def _capture_frame(self, sct: Optional[mss.base.MSSBase] = None) -> np.ndarray:
         """
         Grab a single frame using ``mss`` and return it as a BGR array.
+
+        Parameters
+        ----------
+        sct:
+            An existing ``mss`` context to reuse.  If ``None`` a temporary
+            context is created (used by :meth:`grab_frame`).
 
         Raises
         ------
         RuntimeError
             If capture fails.
         """
-        with mss.mss() as sct:
+        if sct is not None:
             monitor = self._build_mss_monitor(sct)
             screenshot = sct.grab(monitor)
-            # mss returns BGRA; drop the alpha channel to get BGR.
             bgra = np.array(screenshot, dtype=np.uint8)
-            bgr = bgra[:, :, :3]
-            return bgr
+            return bgra[:, :, :3]
+
+        # Fallback: open a one-shot context (for synchronous grab_frame calls)
+        with mss.mss() as tmp_sct:
+            monitor = self._build_mss_monitor(tmp_sct)
+            screenshot = tmp_sct.grab(monitor)
+            bgra = np.array(screenshot, dtype=np.uint8)
+            return bgra[:, :, :3]
 
     def _capture_loop(self) -> None:
-        """Main loop executed in the background daemon thread."""
-        while self._running:
-            try:
-                frame = self._capture_frame()
-                ts = time.monotonic()
+        """Main loop executed in the background daemon thread.
 
-                with self._frame_lock:
-                    self._latest_frame = frame
+        Holds a single persistent ``mss`` context for the lifetime of the
+        loop to avoid the overhead of creating and tearing down the
+        platform screen-capture handle on every frame.
+        """
+        with mss.mss() as sct:
+            while self._running:
+                try:
+                    frame = self._capture_frame(sct)
+                    ts = time.monotonic()
 
-                with self._fps_lock:
-                    self._timestamps.append(ts)
+                    with self._frame_lock:
+                        self._latest_frame = frame
 
-            except RuntimeError as exc:
-                logger.error("ScreenCapture error: %s", exc)
-                # Brief pause before retrying to avoid hammering the system.
-                time.sleep(0.1)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.exception("Unexpected error in capture loop: %s", exc)
-                time.sleep(0.1)
+                    with self._fps_lock:
+                        self._timestamps.append(ts)
+
+                except RuntimeError as exc:
+                    logger.error("ScreenCapture error: %s", exc)
+                    # Brief pause before retrying to avoid hammering the system.
+                    time.sleep(0.1)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception("Unexpected error in capture loop: %s", exc)
+                    time.sleep(0.1)

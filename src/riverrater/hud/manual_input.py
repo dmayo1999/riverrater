@@ -83,6 +83,7 @@ class ManualCardInput(QDialog):
     """
 
     card_added = pyqtSignal(str, str)  # (card_str, target)
+    shoe_reset = pyqtSignal()           # Emitted when user requests a new shoe
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -217,6 +218,13 @@ class ManualCardInput(QDialog):
         )
         self._reset_btn.clicked.connect(self._on_reset)
 
+        self._new_shoe_btn = QPushButton("New Shoe")
+        self._new_shoe_btn.setFixedSize(80, 28)
+        self._new_shoe_btn.setStyleSheet(
+            f"background-color: rgba(120,80,0,180); font-size: 11px;"
+        )
+        self._new_shoe_btn.clicked.connect(self._on_new_shoe)
+
         self._done_btn = QPushButton("Done")
         self._done_btn.setFixedSize(60, 28)
         self._done_btn.setStyleSheet(
@@ -226,6 +234,7 @@ class ManualCardInput(QDialog):
 
         bottom_row.addWidget(self._selection_lbl)
         bottom_row.addStretch()
+        bottom_row.addWidget(self._new_shoe_btn)
         bottom_row.addWidget(self._reset_btn)
         bottom_row.addWidget(self._done_btn)
         root.addLayout(bottom_row)
@@ -275,6 +284,14 @@ class ManualCardInput(QDialog):
         self._selection_lbl.setText("Hand reset")
         self._selection_lbl.setStyleSheet(f"color: {_CLR_MUTED}; font-size: 11px;")
         logger.debug("Manual input: hand reset requested.")
+
+    def _on_new_shoe(self) -> None:
+        """Signal that the dealer is shuffling a new shoe — clears everything."""
+        self.shoe_reset.emit()
+        self._clear_rank_selection()
+        self._selection_lbl.setText("New shoe — counts cleared")
+        self._selection_lbl.setStyleSheet(f"color: {_CLR_YELLOW}; font-size: 11px;")
+        logger.debug("Manual input: new shoe requested.")
 
     def _cycle_target(self) -> None:
         """Cycle through input target modes."""

@@ -237,11 +237,15 @@ def calculate_ev(
 
     ev_call  = win_pct * pot_size  -  (1 - win_pct) * bet_to_call
     ev_fold  = 0.0
-    ev_raise = 1.5 * ev_call  (rough heuristic)
+    ev_raise = 1.5 * ev_call when ev_call > 0, else ev_call (don't
+               amplify negative EV — raising a losing hand is worse
+               than calling, not 1.5× better).
     """
     ev_call = (win_pct * pot_size) - ((1.0 - win_pct) * bet_to_call)
     ev_fold = 0.0
-    ev_raise = ev_call * 2.0 if ev_call < 0 else 1.5 * ev_call
+    # Only amplify positive EV; when ev_call is negative, raising is
+    # strictly worse (more money into a losing spot).
+    ev_raise = 1.5 * ev_call if ev_call > 0 else ev_call * 2.0
     return (ev_call, ev_fold, ev_raise)
 
 

@@ -122,6 +122,7 @@ class AppConfig:
     hotkey_manual_card: str = "<ctrl>+<shift>+m"
     hotkey_reset_hand: str = "<ctrl>+<shift>+r"
     hotkey_switch_mode: str = "<ctrl>+<shift>+s"
+    hotkey_reset_shoe: str = "<ctrl>+<shift>+n"  # "New shoe"
     hotkey_poker_input: str = "<ctrl>+<shift>+p"
 
     @classmethod
@@ -213,6 +214,13 @@ class GameController:
         self._last_poker_result = PokerResult()
         self._last_bj_result = BlackjackResult()
 
+        # Frame-skip: only run expensive template matching when the frame
+        # has changed significantly.  Stores a downsampled grayscale hash
+        # of the previous frame.
+        self._prev_frame_hash: Optional[float] = None
+        self._frame_change_threshold: float = 5.0  # Mean pixel diff threshold
+        self._detect_every_n: int = 3  # Run detection at most every N ticks
+
         # Stats
         self._frame_count: int = 0
 
@@ -242,9 +250,20 @@ class GameController:
             self._tick_blackjack()
 
     def _tick_poker(self) -> None:
-        """Process one poker frame."""
+        """Process one poker frame.
+
+        Runs template detection only when the captured frame has changed
+        significantly from the previous one (mean pixel delta above
+        threshold) and at most every ``_detect_every_n`` ticks.  This
+        avoids burning CPU on template matching when the screen is idle.
+        """
         frame = self.capture.get_latest_frame()
-        if frame is not None:
+        should_detect = False
+
+        if frame is not None and self._frame_count % self._detect_every_n == 0:
+            should_detect = self._frame_changed(frame)
+
+        if should_detect and frame is not None:
             detections = self.template_engine.detect_cards(
                 frame,
                 confidence=self.config.detection_confidence,
@@ -258,9 +277,32 @@ class GameController:
         if self.overlay is not None:
             self.overlay.update_poker(result)
 
+    def _frame_changed(self, frame: "np.ndarray") -> bool:
+        """Return True if *frame* differs enough from the previous to warrant re-detection."""
+        try:
+            import cv2
+            small = cv2.resize(frame, (64, 48))
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(float)
+            current_hash = gray.mean()
+
+            if self._prev_frame_hash is None:
+                self._prev_frame_hash = current_hash
+                return True
+
+            delta = abs(current_hash - self._prev_frame_hash)
+            self._prev_frame_hash = current_hash
+            return delta > self._frame_change_threshold
+        except Exception:
+            return True  # If anything fails, run detection anyway
+
     def _tick_blackjack(self) -> None:
         """Process one blackjack tick (state is updated via manual input)."""
-        result = analyze_blackjack(self.blackjack_state)
+        result = analyze_blackjack(
+            self.blackjack_state,
+            min_bet=self.config.min_bet,
+            max_bet=self.config.max_bet,
+            bankroll=self.config.bankroll,
+        )
         self._last_bj_result = result
 
         if self.overlay is not None:
@@ -318,16 +360,23 @@ class GameController:
         if target == "player":
             if card not in self.blackjack_state.player_hand:
                 self.blackjack_state.player_hand.append(card)
-                self.blackjack_state.cards_seen.append(card)
+                # Only add to seen if not already tracked (prevents count corruption)
+                if card not in self.blackjack_state.cards_seen:
+                    self.blackjack_state.cards_seen.append(card)
                 logger.info("Player hand: %s added.", card_str)
+            else:
+                logger.debug("Player card %s already in hand — skipping.", card_str)
         elif target == "dealer":
             self.blackjack_state.dealer_upcard = card
-            self.blackjack_state.cards_seen.append(card)
+            if card not in self.blackjack_state.cards_seen:
+                self.blackjack_state.cards_seen.append(card)
             logger.info("Dealer upcard: %s.", card_str)
         elif target == "seen":
             if card not in self.blackjack_state.cards_seen:
                 self.blackjack_state.cards_seen.append(card)
                 logger.debug("Seen card: %s.", card_str)
+            else:
+                logger.debug("Card %s already seen — skipping.", card_str)
         else:
             logger.warning("Unknown target %r for card %s.", target, card_str)
 
@@ -346,6 +395,14 @@ class GameController:
             self.blackjack_state = BlackjackState(num_decks=self.config.num_decks)
             self.blackjack_state.cards_seen = seen
             logger.info("Blackjack hand reset (shoe memory preserved).")
+
+    def reset_shoe(self) -> None:
+        """Clear the entire shoe — running count, cards seen, everything.
+
+        Use when the dealer shuffles a new shoe.
+        """
+        self.blackjack_state = BlackjackState(num_decks=self.config.num_decks)
+        logger.info("Shoe reset — all counts cleared.")
 
     def set_poker_values(self, pot_size: float, bet_to_call: float, num_opponents: int) -> None:
         """Update poker state with manually entered pot/bet values.
@@ -541,6 +598,7 @@ def main(argv: list[str] | None = None) -> int:
     # -- Manual card input signal connection ---------------------------------
     if manual_input is not None:
         manual_input.card_added.connect(controller.add_card_manual)
+        manual_input.shoe_reset.connect(controller.reset_shoe)
 
     # -- Hotkeys -------------------------------------------------------------
     hotkeys = HotkeyManager()
@@ -586,17 +644,23 @@ def main(argv: list[str] | None = None) -> int:
     hotkeys.register(config.hotkey_calibrate, _calibrate)
     hotkeys.register(config.hotkey_manual_card, _show_manual_input)
     hotkeys.register(config.hotkey_reset_hand, _reset_hand)
+    def _reset_shoe() -> None:
+        controller.reset_shoe()
+        logger.info("Shoe reset via hotkey.")
+
     hotkeys.register(config.hotkey_switch_mode, _switch_mode)
+    hotkeys.register(config.hotkey_reset_shoe, _reset_shoe)
     hotkeys.register(config.hotkey_poker_input, _show_poker_input)
     hotkeys.start()
 
     logger.info(
-        "Hotkeys registered: toggle=%s, calibrate=%s, manual=%s, reset=%s, switch=%s, poker_input=%s",
+        "Hotkeys registered: toggle=%s, calibrate=%s, manual=%s, reset=%s, switch=%s, shoe=%s, poker_input=%s",
         config.hotkey_toggle_hud,
         config.hotkey_calibrate,
         config.hotkey_manual_card,
         config.hotkey_reset_hand,
         config.hotkey_switch_mode,
+        config.hotkey_reset_shoe,
         config.hotkey_poker_input,
     )
 

@@ -292,8 +292,25 @@ def shoe_favorability(tc: float) -> float:
 # Full analysis pipeline
 # ---------------------------------------------------------------------------
 
-def analyze_blackjack(state: BlackjackState) -> BlackjackResult:
-    """Run full blackjack analysis and return a populated BlackjackResult."""
+def analyze_blackjack(
+    state: BlackjackState,
+    min_bet: float = 10.0,
+    max_bet: float = 500.0,
+    bankroll: float = 5000.0,
+) -> BlackjackResult:
+    """Run full blackjack analysis and return a populated BlackjackResult.
+
+    Parameters
+    ----------
+    state:
+        Current blackjack hand and shoe state.
+    min_bet:
+        Table minimum bet (from config).
+    max_bet:
+        Table maximum bet (from config).
+    bankroll:
+        Player's current bankroll (from config).
+    """
     # Hand value
     hand_total, is_soft = hand_value(state.player_hand)
 
@@ -308,12 +325,12 @@ def analyze_blackjack(state: BlackjackState) -> BlackjackResult:
     if state.dealer_upcard is not None and len(state.player_hand) >= 2:
         recommended_action = basic_strategy(state.player_hand, state.dealer_upcard)
 
-    # Kelly bet
+    # Kelly bet — now uses caller-provided config values
     recommended_bet = kelly_bet(
         tc=tc,
-        min_bet=10.0,
-        max_bet=500.0,
-        bankroll=5000.0,
+        min_bet=min_bet,
+        max_bet=max_bet,
+        bankroll=bankroll,
     )
 
     # Shoe favourability
