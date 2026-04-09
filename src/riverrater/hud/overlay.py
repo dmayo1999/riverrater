@@ -18,57 +18,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-try:
-    from riverrater.game.state import GameMode, PokerResult, BlackjackResult
-except ImportError:
-    from dataclasses import dataclass
-    from enum import Enum
-
-    class GameMode(Enum):  # type: ignore[no-redef]
-        POKER = "poker"
-        BLACKJACK = "blackjack"
-
-    @dataclass
-    class PokerResult:  # type: ignore[no-redef]
-        win_pct: float = 0.0
-        tie_pct: float = 0.0
-        required_equity: float = 0.0
-        actual_equity: float = 0.0
-        ev_call: float = 0.0
-        ev_fold: float = 0.0
-        ev_raise: float = 0.0
-        recommended_action: Optional[object] = None
-
-    @dataclass
-    class BlackjackResult:  # type: ignore[no-redef]
-        running_count: int = 0
-        true_count: float = 0.0
-        recommended_action: Optional[object] = None
-        recommended_bet: float = 0.0
-        shoe_favorability: float = 0.0
-        hand_total: int = 0
-        is_soft: bool = False
-
-try:
-    from riverrater.hud.poker_view import PokerView
-    from riverrater.hud.blackjack_view import BlackjackView
-except ImportError:
-    # Fallback stubs so overlay.py is still importable in isolation.
-    from PyQt6.QtWidgets import QLabel  # type: ignore[assignment]
-
-    class PokerView(QWidget):  # type: ignore[no-redef]
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            lbl = QLabel("PokerView (stub)", self)
-        def update(self, result):  # noqa: D102
-            pass
-
-    class BlackjackView(QWidget):  # type: ignore[no-redef]
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            lbl = QLabel("BlackjackView (stub)", self)
-        def update(self, result):  # noqa: D102
-            pass
+from riverrater.game.state import GameMode, PokerResult, BlackjackResult
+from riverrater.hud.poker_view import PokerView
+from riverrater.hud.blackjack_view import BlackjackView
 
 logger = logging.getLogger(__name__)
 

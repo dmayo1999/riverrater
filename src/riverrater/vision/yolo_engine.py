@@ -53,52 +53,7 @@ from typing import Optional
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Import Card / Rank / Suit from game.state if available; fall back to local
-# definitions so yolo_engine.py can be imported before game.state is built.
-# ---------------------------------------------------------------------------
-try:
-    from riverrater.game.state import Card, Rank, Suit
-except ImportError:
-    from enum import Enum  # type: ignore[assignment]
-    from dataclasses import dataclass as _dataclass
-
-    class Suit(Enum):  # type: ignore[no-redef]
-        HEARTS = "h"
-        DIAMONDS = "d"
-        CLUBS = "c"
-        SPADES = "s"
-
-    class Rank(Enum):  # type: ignore[no-redef]
-        TWO = "2"
-        THREE = "3"
-        FOUR = "4"
-        FIVE = "5"
-        SIX = "6"
-        SEVEN = "7"
-        EIGHT = "8"
-        NINE = "9"
-        TEN = "T"
-        JACK = "J"
-        QUEEN = "Q"
-        KING = "K"
-        ACE = "A"
-
-    @_dataclass
-    class Card:  # type: ignore[no-redef]
-        rank: Rank
-        suit: Suit
-
-        def __str__(self) -> str:
-            return f"{self.rank.value}{self.suit.value}"
-
-        def __hash__(self) -> int:
-            return hash((self.rank, self.suit))
-
-        def __eq__(self, other: object) -> bool:
-            if not isinstance(other, Card):
-                return False
-            return self.rank == other.rank and self.suit == other.suit
+from riverrater.game.state import Card, Rank, Suit
 
 
 logger = logging.getLogger(__name__)

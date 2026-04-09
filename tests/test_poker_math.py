@@ -270,9 +270,15 @@ class TestEV:
         ev_call, ev_fold, ev_raise = calculate_ev(0.10, 100.0, 300.0)
         assert ev_call < 0, f"ev_call={ev_call:.2f} should be negative"
 
-    def test_ev_raise_is_1_5x_call(self):
+    def test_ev_raise_is_1_5x_call_when_positive(self):
         ev_call, ev_fold, ev_raise = calculate_ev(0.60, 100.0, 50.0)
+        assert ev_call > 0, "Precondition: ev_call should be positive"
         assert abs(ev_raise - 1.5 * ev_call) < 1e-9
+
+    def test_ev_raise_is_2x_call_when_negative(self):
+        ev_call, ev_fold, ev_raise = calculate_ev(0.10, 100.0, 300.0)
+        assert ev_call < 0, "Precondition: ev_call should be negative"
+        assert abs(ev_raise - 2.0 * ev_call) < 1e-9
 
     def test_ev_fold_always_zero(self):
         for win in [0.0, 0.5, 1.0]:

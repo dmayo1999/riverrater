@@ -21,28 +21,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-try:
-    from riverrater.game.state import BlackjackAction, BlackjackResult
-except ImportError:
-    from dataclasses import dataclass
-    from enum import Enum
-
-    class BlackjackAction(Enum):  # type: ignore[no-redef]
-        HIT = "Hit"
-        STAND = "Stand"
-        DOUBLE = "Double"
-        SPLIT = "Split"
-        SURRENDER = "Surrender"
-
-    @dataclass
-    class BlackjackResult:  # type: ignore[no-redef]
-        running_count: int = 0
-        true_count: float = 0.0
-        recommended_action: Optional[BlackjackAction] = None
-        recommended_bet: float = 0.0
-        shoe_favorability: float = 0.0
-        hand_total: int = 0
-        is_soft: bool = False
+from riverrater.game.state import BlackjackAction, BlackjackResult
 
 logger = logging.getLogger(__name__)
 

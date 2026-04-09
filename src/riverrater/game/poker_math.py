@@ -241,7 +241,7 @@ def calculate_ev(
     """
     ev_call = (win_pct * pot_size) - ((1.0 - win_pct) * bet_to_call)
     ev_fold = 0.0
-    ev_raise = 1.5 * ev_call
+    ev_raise = ev_call * 2.0 if ev_call < 0 else 1.5 * ev_call
     return (ev_call, ev_fold, ev_raise)
 
 

@@ -40,147 +40,41 @@ from riverrater.utils.logging import get_logger, setup_logging
 logger = get_logger(__name__)
 
 # -- Game state --------------------------------------------------------------
-try:
-    from riverrater.game.state import (
-        BlackjackAction,
-        BlackjackResult,
-        BlackjackState,
-        Card,
-        GameMode,
-        PokerResult,
-        PokerState,
-        Rank,
-        Suit,
-    )
-    _HAS_STATE = True
-except ImportError as _e:
-    logger.warning("game.state not available: %s", _e)
-    _HAS_STATE = False
-    # Minimal stubs so the rest of this file can be imported.
-    from enum import Enum
-    from dataclasses import dataclass as _dc, field as _f
-    from typing import Optional as _Opt
-
-    class GameMode(Enum):  # type: ignore[no-redef]
-        POKER = "poker"
-        BLACKJACK = "blackjack"
-
-    class Suit(Enum):  # type: ignore[no-redef]
-        HEARTS = "h"; DIAMONDS = "d"; CLUBS = "c"; SPADES = "s"
-
-    class Rank(Enum):  # type: ignore[no-redef]
-        TWO = "2"; THREE = "3"; FOUR = "4"; FIVE = "5"; SIX = "6"
-        SEVEN = "7"; EIGHT = "8"; NINE = "9"; TEN = "T"
-        JACK = "J"; QUEEN = "Q"; KING = "K"; ACE = "A"
-
-    @_dc
-    class Card:  # type: ignore[no-redef]
-        rank: Rank; suit: Suit
-        def __str__(self): return f"{self.rank.value}{self.suit.value}"
-        def __hash__(self): return hash((self.rank, self.suit))
-        def __eq__(self, other): return isinstance(other, Card) and self.rank == other.rank and self.suit == other.suit
-
-    @_dc
-    class PokerState:  # type: ignore[no-redef]
-        hole_cards: list = _f(default_factory=list)
-        community_cards: list = _f(default_factory=list)
-        pot_size: float = 0.0; bet_to_call: float = 0.0; num_opponents: int = 1
-
-    @_dc
-    class BlackjackState:  # type: ignore[no-redef]
-        player_hand: list = _f(default_factory=list)
-        dealer_upcard: _Opt[Card] = None
-        cards_seen: list = _f(default_factory=list)
-        num_decks: int = 6
-
-    @_dc
-    class PokerResult:  # type: ignore[no-redef]
-        win_pct: float = 0.0; tie_pct: float = 0.0
-        required_equity: float = 0.0; actual_equity: float = 0.0
-        ev_call: float = 0.0; ev_fold: float = 0.0; ev_raise: float = 0.0
-        recommended_action: _Opt[object] = None
-
-    @_dc
-    class BlackjackResult:  # type: ignore[no-redef]
-        running_count: int = 0; true_count: float = 0.0
-        recommended_action: _Opt[object] = None
-        recommended_bet: float = 0.0; shoe_favorability: float = 0.0
-        hand_total: int = 0; is_soft: bool = False
+from riverrater.game.state import (
+    BlackjackAction,
+    BlackjackResult,
+    BlackjackState,
+    Card,
+    GameMode,
+    PokerResult,
+    PokerState,
+    Rank,
+    Suit,
+)
 
 # -- Math engines ------------------------------------------------------------
-try:
-    from riverrater.game.poker_math import analyze_poker
-    _HAS_POKER_MATH = True
-except ImportError as _e:
-    logger.warning("poker_math not available: %s — using stub.", _e)
-    _HAS_POKER_MATH = False
-    def analyze_poker(state) -> PokerResult:  # type: ignore[misc]
-        return PokerResult()
-
-try:
-    from riverrater.game.blackjack_math import analyze_blackjack
-    _HAS_BJ_MATH = True
-except ImportError as _e:
-    logger.warning("blackjack_math not available: %s — using stub.", _e)
-    _HAS_BJ_MATH = False
-    def analyze_blackjack(state) -> BlackjackResult:  # type: ignore[misc]
-        return BlackjackResult()
+from riverrater.game.poker_math import analyze_poker
+from riverrater.game.blackjack_math import analyze_blackjack
 
 # -- Screen capture ----------------------------------------------------------
-try:
-    from riverrater.capture.screen import ScreenCapture
-    _HAS_CAPTURE = True
-except ImportError as _e:
-    logger.warning("capture.screen not available: %s — using stub.", _e)
-    _HAS_CAPTURE = False
-
-    class ScreenCapture:  # type: ignore[no-redef]
-        def __init__(self, region=None): self._region = region
-        def set_region(self, region): self._region = region
-        def grab_frame(self): return None
-        def get_fps(self): return 0.0
-        def start(self): pass
-        def stop(self): pass
-        def get_latest_frame(self): return None
+from riverrater.capture.screen import ScreenCapture
 
 # -- Vision engines ----------------------------------------------------------
-try:
-    from riverrater.vision.template_engine import TemplateEngine
-    _HAS_TEMPLATE = True
-except ImportError as _e:
-    logger.warning("vision.template_engine not available: %s — using stub.", _e)
-    _HAS_TEMPLATE = False
-
-    class TemplateEngine:  # type: ignore[no-redef]
-        def __init__(self, profile_path=None): pass
-        def detect_cards(self, frame, confidence=0.8): return []
-        def add_template(self, card, template_image): pass
-        def save_profile(self, path): pass
-        def load_profile(self, path): pass
-
-try:
-    from riverrater.vision.yolo_engine import YOLOEngine
-    _HAS_YOLO = True
-except ImportError as _e:
-    logger.warning("vision.yolo_engine not available: %s — using stub.", _e)
-    _HAS_YOLO = False
-
-    class YOLOEngine:  # type: ignore[no-redef]
-        def __init__(self, model_path=None): self._model = None
-        def detect_cards(self, frame, confidence=0.5): return []
-        @property
-        def is_available(self): return False
+from riverrater.vision.template_engine import TemplateEngine
+from riverrater.vision.yolo_engine import YOLOEngine
 
 # -- HUD overlay -------------------------------------------------------------
 try:
     from riverrater.hud.overlay import HUDOverlay
     from riverrater.hud.manual_input import ManualCardInput
+    from riverrater.hud.poker_input import PokerInputDialog
     _HAS_HUD = True
 except ImportError as _e:
     logger.warning("hud not available: %s", _e)
     _HAS_HUD = False
     HUDOverlay = None  # type: ignore[assignment,misc]
     ManualCardInput = None  # type: ignore[assignment,misc]
+    PokerInputDialog = None  # type: ignore[assignment,misc]
 
 # -- Hotkeys -----------------------------------------------------------------
 from riverrater.utils.hotkeys import HotkeyManager
@@ -228,6 +122,7 @@ class AppConfig:
     hotkey_manual_card: str = "<ctrl>+<shift>+m"
     hotkey_reset_hand: str = "<ctrl>+<shift>+r"
     hotkey_switch_mode: str = "<ctrl>+<shift>+s"
+    hotkey_poker_input: str = "<ctrl>+<shift>+p"
 
     @classmethod
     def load(cls, path: str | Path) -> "AppConfig":
@@ -452,6 +347,22 @@ class GameController:
             self.blackjack_state.cards_seen = seen
             logger.info("Blackjack hand reset (shoe memory preserved).")
 
+    def set_poker_values(self, pot_size: float, bet_to_call: float, num_opponents: int) -> None:
+        """Update poker state with manually entered pot/bet values.
+
+        Args:
+            pot_size: Current pot size.
+            bet_to_call: Amount needed to call.
+            num_opponents: Number of active opponents.
+        """
+        self.poker_state.pot_size = pot_size
+        self.poker_state.bet_to_call = bet_to_call
+        self.poker_state.num_opponents = num_opponents
+        logger.info(
+            "Poker values set: pot=%.2f, bet=%.2f, opp=%d",
+            pot_size, bet_to_call, num_opponents,
+        )
+
     def switch_mode(self) -> None:
         """Toggle between poker and blackjack modes."""
         if self.mode == GameMode.POKER:
@@ -620,6 +531,13 @@ def main(argv: list[str] | None = None) -> int:
         overlay=overlay,
     )
 
+    # -- Poker input dialog (for poker mode) ----------------------------------
+    poker_input: Optional[PokerInputDialog] = None
+    if _HAS_HUD and PokerInputDialog is not None:
+        poker_input = PokerInputDialog(overlay)
+        poker_input.values_submitted.connect(controller.set_poker_values)
+        logger.debug("PokerInputDialog created.")
+
     # -- Manual card input signal connection ---------------------------------
     if manual_input is not None:
         manual_input.card_added.connect(controller.add_card_manual)
@@ -658,20 +576,28 @@ def main(argv: list[str] | None = None) -> int:
                 Q_ARG("PyQt_PyObject", controller.mode),
             )
 
+    def _show_poker_input() -> None:
+        if poker_input is not None:
+            QMetaObject.invokeMethod(poker_input, "show", Qt.ConnectionType.QueuedConnection)
+            QMetaObject.invokeMethod(poker_input, "raise_", Qt.ConnectionType.QueuedConnection)
+            QMetaObject.invokeMethod(poker_input, "activateWindow", Qt.ConnectionType.QueuedConnection)
+
     hotkeys.register(config.hotkey_toggle_hud, _toggle_hud)
     hotkeys.register(config.hotkey_calibrate, _calibrate)
     hotkeys.register(config.hotkey_manual_card, _show_manual_input)
     hotkeys.register(config.hotkey_reset_hand, _reset_hand)
     hotkeys.register(config.hotkey_switch_mode, _switch_mode)
+    hotkeys.register(config.hotkey_poker_input, _show_poker_input)
     hotkeys.start()
 
     logger.info(
-        "Hotkeys registered: toggle=%s, calibrate=%s, manual=%s, reset=%s, switch=%s",
+        "Hotkeys registered: toggle=%s, calibrate=%s, manual=%s, reset=%s, switch=%s, poker_input=%s",
         config.hotkey_toggle_hud,
         config.hotkey_calibrate,
         config.hotkey_manual_card,
         config.hotkey_reset_hand,
         config.hotkey_switch_mode,
+        config.hotkey_poker_input,
     )
 
     # -- Processing timer (30fps) -------------------------------------------

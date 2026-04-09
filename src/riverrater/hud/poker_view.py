@@ -20,27 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-try:
-    from riverrater.game.state import PokerAction, PokerResult
-except ImportError:
-    from dataclasses import dataclass
-    from enum import Enum
-
-    class PokerAction(Enum):  # type: ignore[no-redef]
-        FOLD = "fold"
-        CALL = "call"
-        RAISE = "raise"
-
-    @dataclass
-    class PokerResult:  # type: ignore[no-redef]
-        win_pct: float = 0.0
-        tie_pct: float = 0.0
-        required_equity: float = 0.0
-        actual_equity: float = 0.0
-        ev_call: float = 0.0
-        ev_fold: float = 0.0
-        ev_raise: float = 0.0
-        recommended_action: Optional[PokerAction] = None
+from riverrater.game.state import PokerAction, PokerResult
 
 logger = logging.getLogger(__name__)
 
