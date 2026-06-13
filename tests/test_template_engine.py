@@ -11,9 +11,11 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -496,3 +498,127 @@ class TestMultiScaleDetection:
         assert any(d[0] == ace_of_hearts for d in detections), (
             "Multi-scale detection failed to find card at smaller scale."
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: ROI-scoped detection
+# ---------------------------------------------------------------------------
+
+
+class TestRoiScopedDetection:
+    """Scoped search uses saved card-slot regions; empty regions fall back to full frame."""
+
+    def _make_engine_with_card(self, ace_of_hearts: Card) -> tuple[TemplateEngine, np.ndarray, np.ndarray]:
+        card_img = _make_card_image((0, 180, 255), size=(15, 20))
+        engine = TemplateEngine()
+        engine.add_template(ace_of_hearts, card_img)
+        scene = np.full((80, 100, 3), 128, dtype=np.uint8)
+        scene[20 : 20 + card_img.shape[0], 25 : 25 + card_img.shape[1]] = card_img
+        return engine, card_img, scene
+
+    def test_no_roi_regions_uses_full_frame_fallback(self, ace_of_hearts: Card) -> None:
+        engine, _, scene = self._make_engine_with_card(ace_of_hearts)
+        assert engine.roi_regions == []
+        assert engine.uses_roi_scoped_search is False
+        detections = engine.detect_cards(scene, confidence=0.90)
+        assert any(d[0] == ace_of_hearts for d in detections)
+
+    def test_set_roi_regions_enables_scoped_search(self, ace_of_hearts: Card) -> None:
+        engine, card_img, scene = self._make_engine_with_card(ace_of_hearts)
+        engine.set_roi_regions([(25, 20, card_img.shape[1], card_img.shape[0])])
+        assert engine.uses_roi_scoped_search is True
+        detections = engine.detect_cards(scene, confidence=0.90)
+        assert any(d[0] == ace_of_hearts for d in detections)
+
+    def test_match_template_search_area_smaller_with_roi(self, ace_of_hearts: Card) -> None:
+        engine, card_img, scene = self._make_engine_with_card(ace_of_hearts)
+        search_areas: list[tuple[int, int]] = []
+        real_match_template = cv2.matchTemplate
+
+        def _record_match_template(search_img: np.ndarray, tmpl: np.ndarray, method: int) -> np.ndarray:
+            search_areas.append(search_img.shape[:2])
+            return real_match_template(search_img, tmpl, method)
+
+        with patch("riverrater.vision.template_engine.cv2.matchTemplate", side_effect=_record_match_template):
+            engine.detect_cards(scene, confidence=0.90)
+            full_frame_max_h = max(h for h, _ in search_areas)
+
+            search_areas.clear()
+            engine.set_roi_regions([(25, 20, card_img.shape[1], card_img.shape[0])])
+            engine.detect_cards(scene, confidence=0.90)
+            roi_max_h = max(h for h, _ in search_areas)
+
+        assert roi_max_h < full_frame_max_h
+
+    def test_match_template_call_count_scales_with_roi_slots(self, ace_of_hearts: Card) -> None:
+        engine, card_img, scene = self._make_engine_with_card(ace_of_hearts)
+
+        with patch(
+            "riverrater.vision.template_engine.cv2.matchTemplate",
+            return_value=np.zeros((1, 1), dtype=np.float32),
+        ) as mock_match:
+            engine.detect_cards(scene, confidence=0.99)
+            full_frame_calls = mock_match.call_count
+
+            mock_match.reset_mock()
+            engine.set_roi_regions(
+                [
+                    (25, 20, card_img.shape[1], card_img.shape[0]),
+                    (60, 20, card_img.shape[1], card_img.shape[0]),
+                ]
+            )
+            engine.detect_cards(scene, confidence=0.99)
+            roi_calls = mock_match.call_count
+
+        # Two slots should roughly double matchTemplate calls; smaller crops may skip a scale.
+        assert roi_calls > full_frame_calls
+        assert roi_calls >= full_frame_calls * 2 - 2
+
+    def test_roi_regions_roundtrip_in_profile(self, ace_of_hearts: Card, card_image: np.ndarray) -> None:
+        engine = TemplateEngine()
+        engine.add_template(ace_of_hearts, card_image)
+        engine.set_roi_regions([(10, 20, 40, 60), (70, 20, 40, 60)])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine.save_profile(tmpdir)
+            regions_path = Path(tmpdir) / "regions.json"
+            assert regions_path.exists()
+
+            with regions_path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            assert payload["card_slots"] == [[10, 20, 40, 60], [70, 20, 40, 60]]
+
+            engine2 = TemplateEngine()
+            engine2.load_profile(tmpdir)
+            assert engine2.roi_regions == [(10, 20, 40, 60), (70, 20, 40, 60)]
+            assert engine2.uses_roi_scoped_search is True
+
+    def test_roi_scoped_search_uses_minmaxloc_not_where(
+        self, ace_of_hearts: Card
+    ) -> None:
+        """ROI-scoped detection uses cv2.minMaxLoc for peak matching."""
+        engine, card_img, scene = self._make_engine_with_card(ace_of_hearts)
+        engine.set_roi_regions([(25, 20, card_img.shape[1], card_img.shape[0])])
+
+        with patch("riverrater.vision.template_engine.cv2.minMaxLoc") as mock_minmax:
+            mock_minmax.return_value = (0.0, 0.95, (0, 0), (5, 10))
+            with patch("riverrater.vision.template_engine.cv2.matchTemplate") as mock_match:
+                mock_match.return_value = np.zeros((20, 20), dtype=np.float32)
+                detections = engine.detect_cards(scene, confidence=0.80)
+
+        assert mock_minmax.called
+        assert any(d[0] == ace_of_hearts for d in detections)
+
+    def test_profile_without_regions_json_falls_back_to_full_frame(
+        self, ace_of_hearts: Card, card_image: np.ndarray
+    ) -> None:
+        engine = TemplateEngine()
+        engine.add_template(ace_of_hearts, card_image)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine.save_profile(tmpdir)
+            engine2 = TemplateEngine()
+            engine2.load_profile(tmpdir)
+
+        assert engine2.roi_regions == []
+        assert engine2.uses_roi_scoped_search is False

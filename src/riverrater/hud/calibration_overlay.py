@@ -22,10 +22,10 @@ from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -55,6 +55,45 @@ _SUITS = [
     ("\u2663", "c", "#C0C0D0"),  # ♣
     ("\u2660", "s", "#C0C0D0"),  # ♠
 ]
+
+_SUIT_SYMBOLS = {code: symbol for symbol, code, _ in _SUITS}
+
+# Canonical ordering for guided capture (rank-major within each suit).
+ALL_CARD_STRINGS: list[str] = [
+    f"{rank}{suit_code}" for suit_code in ("h", "d", "c", "s") for rank in _RANKS
+]
+
+
+def get_captured_cards(
+    template_engine: object,
+    entries: list[tuple[str, tuple[int, int, int, int]]],
+) -> set[str]:
+    """Return card strings that already have templates (engine + session)."""
+    captured: set[str] = set()
+    tmpl_dict = getattr(template_engine, "_templates", None)
+    if tmpl_dict:
+        for card, tmpls in tmpl_dict.items():
+            if tmpls:
+                captured.add(str(card))
+    for card_str, _bbox in entries:
+        captured.add(card_str)
+    return captured
+
+
+def next_missing_card(captured: set[str]) -> Optional[str]:
+    """Return the next card string without a template, or None if complete."""
+    for card_str in ALL_CARD_STRINGS:
+        if card_str not in captured:
+            return card_str
+    return None
+
+
+def format_guided_prompt(card_str: str) -> str:
+    """Build the guided-capture instruction for a missing card."""
+    rank = card_str[0]
+    suit_code = card_str[1]
+    symbol = _SUIT_SYMBOLS.get(suit_code, suit_code)
+    return f"Try to capture: {rank}{symbol} (no template yet)"
 
 
 class _HRule(QFrame):
@@ -105,6 +144,10 @@ class CalibrationOverlay(QWidget):
         self._draw_end: Optional[QPoint] = None
         self._pending_bbox: Optional[tuple[int, int, int, int]] = None  # (x, y, w, h) in frame coords
 
+        # Drag-to-reposition state for confirmed bboxes
+        self._dragging_entry_idx: Optional[int] = None
+        self._drag_offset: Optional[QPoint] = None
+
         # Selection state
         self._selected_rank: Optional[str] = None
         self._selected_suit: Optional[str] = None
@@ -117,6 +160,7 @@ class CalibrationOverlay(QWidget):
 
         self._setup_ui()
         self._update_button_states()
+        self._update_progress_display()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -225,8 +269,8 @@ class CalibrationOverlay(QWidget):
             suit_row.addWidget(btn)
         panel_layout.addLayout(suit_row)
 
-        # ROI preview
-        roi_lbl = QLabel("PREVIEW")
+        # ROI preview (2x zoom inset)
+        roi_lbl = QLabel("PREVIEW (2×)")
         roi_lbl.setStyleSheet(
             f"color: {_CLR_MUTED}; font-size: 9px; letter-spacing: 1px; font-weight: 600;"
         )
@@ -239,7 +283,7 @@ class CalibrationOverlay(QWidget):
             " border-radius: 4px;"
         )
         self._roi_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._roi_preview.setScaledContents(True)
+        self._roi_preview.setScaledContents(False)
         panel_layout.addWidget(self._roi_preview)
 
         # Confirm button
@@ -253,10 +297,32 @@ class CalibrationOverlay(QWidget):
         self._confirm_btn.clicked.connect(self._on_confirm)
         panel_layout.addWidget(self._confirm_btn)
 
-        # Counter
-        self._counter_label = QLabel("0 cards captured")
+        # Progress counter
+        self._counter_label = QLabel("0/52 cards with templates")
         self._counter_label.setStyleSheet(f"color: {_CLR_MUTED}; font-size: 11px;")
         panel_layout.addWidget(self._counter_label)
+
+        # 52-card progress grid (4 suits × 13 ranks)
+        grid_lbl = QLabel("PROGRESS")
+        grid_lbl.setStyleSheet(
+            f"color: {_CLR_MUTED}; font-size: 9px; letter-spacing: 1px; font-weight: 600;"
+        )
+        panel_layout.addWidget(grid_lbl)
+
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(1)
+        self._grid_cells: dict[str, QLabel] = {}
+        for suit_row, (_symbol, suit_code, suit_color) in enumerate(_SUITS):
+            for rank_col, rank in enumerate(_RANKS):
+                card_str = f"{rank}{suit_code}"
+                cell = QLabel(rank)
+                cell.setFixedSize(16, 14)
+                cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell.setToolTip(card_str)
+                self._style_grid_cell(cell, captured=False, suit_color=suit_color)
+                self._grid_cells[card_str] = cell
+                grid_layout.addWidget(cell, suit_row, rank_col)
+        panel_layout.addLayout(grid_layout)
 
         panel_layout.addWidget(_HRule(self._panel))
 
@@ -329,27 +395,60 @@ class CalibrationOverlay(QWidget):
         painter.end()
 
     # ------------------------------------------------------------------
-    # Mouse events (rubber-band drawing)
+    # Mouse events (rubber-band drawing + bbox drag)
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.pos()
-            if self._frame_rect.contains(pos):
-                self._drawing = True
-                self._draw_start = pos
-                self._draw_end = pos
-                self._pending_bbox = None
-                self._update_button_states()
-                self.update()
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        pos = event.pos()
+        if not self._frame_rect.contains(pos):
+            return
+
+        hit_idx = self._hit_test_entry(pos)
+        if hit_idx is not None:
+            self._dragging_entry_idx = hit_idx
+            display_rect = self._frame_to_display_rect(self._entries[hit_idx][1])
+            self._drag_offset = pos - display_rect.topLeft()
+            self._drawing = False
+            self._draw_start = None
+            self._draw_end = None
+            return
+
+        self._drawing = True
+        self._draw_start = pos
+        self._draw_end = pos
+        self._pending_bbox = None
+        self._update_button_states()
+        self.update()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._dragging_entry_idx is not None and self._drag_offset is not None:
+            idx = self._dragging_entry_idx
+            card_str, bbox = self._entries[idx]
+            display_size = self._frame_to_display_rect(bbox).size()
+            new_top_left = event.pos() - self._drag_offset
+            display_rect = QRect(new_top_left, display_size)
+            new_bbox = self._clamp_bbox_to_frame(self._display_to_frame_bbox(display_rect))
+            self._entries[idx] = (card_str, new_bbox)
+            self.update()
+            return
+
         if self._drawing:
             self._draw_end = event.pos()
             self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and self._drawing:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        if self._dragging_entry_idx is not None:
+            self._dragging_entry_idx = None
+            self._drag_offset = None
+            return
+
+        if self._drawing:
             self._drawing = False
             self._draw_end = event.pos()
 
@@ -449,16 +548,15 @@ class CalibrationOverlay(QWidget):
             )
 
         self._roi_preview.clear()
-        self._counter_label.setText(f"{len(self._entries)} cards captured")
-        self._instruction_label.setText("Draw a box around the next card")
+        self._update_progress_display()
         self._update_button_states()
         self.update()
 
     def _on_undo(self) -> None:
         if self._entries:
             self._entries.pop()
-            self._counter_label.setText(f"{len(self._entries)} cards captured")
             self._instruction_label.setText("Last entry removed")
+            self._update_progress_display()
             self._update_button_states()
             self.update()
 
@@ -524,12 +622,68 @@ class CalibrationOverlay(QWidget):
         dh = int(fh * scale_y)
         return QRect(dx, dy, dw, dh)
 
+    def _clamp_bbox_to_frame(self, bbox: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        """Keep a frame-coordinate bbox fully inside the capture."""
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            return bbox
+        x = max(0, min(x, self._frame_w - w))
+        y = max(0, min(y, self._frame_h - h))
+        return (x, y, w, h)
+
+    def _hit_test_entry(self, pos: QPoint) -> Optional[int]:
+        """Return the topmost confirmed entry index under *pos*, if any."""
+        for idx in range(len(self._entries) - 1, -1, -1):
+            _card_str, bbox = self._entries[idx]
+            if self._frame_to_display_rect(bbox).contains(pos):
+                return idx
+        return None
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _style_grid_cell(cell: QLabel, *, captured: bool, suit_color: str) -> None:
+        if captured:
+            cell.setStyleSheet(
+                f"background-color: rgba(0,150,83,200); color: {_CLR_WHITE};"
+                " border: 1px solid rgba(0,200,100,180); border-radius: 2px;"
+                f" font-size: 8px; font-weight: 700; font-family: {_MONO_FONT};"
+            )
+        else:
+            cell.setStyleSheet(
+                f"background-color: rgba(40,40,58,255); color: {suit_color};"
+                " border: 1px solid rgba(60,60,80,180); border-radius: 2px;"
+                f" font-size: 8px; font-family: {_MONO_FONT};"
+            )
+
+    def _update_progress_display(self) -> None:
+        """Refresh counter, progress grid, and guided prompt."""
+        captured = get_captured_cards(self._template_engine, self._entries)
+        self._counter_label.setText(f"{len(captured)}/52 cards with templates")
+
+        for card_str, cell in self._grid_cells.items():
+            suit_color = next(c for _, sc, c in _SUITS if card_str.endswith(sc))
+            self._style_grid_cell(cell, captured=card_str in captured, suit_color=suit_color)
+
+        self._update_guided_prompt()
+
+    def _update_guided_prompt(self) -> None:
+        """Suggest the next missing card when idle."""
+        if self._selected_rank is not None or self._selected_suit is not None:
+            return
+        if self._pending_bbox is not None or self._drawing:
+            return
+
+        missing = next_missing_card(get_captured_cards(self._template_engine, self._entries))
+        if missing is None:
+            self._instruction_label.setText("All 52 cards have templates!")
+        else:
+            self._instruction_label.setText(format_guided_prompt(missing))
+
     def _update_roi_preview(self) -> None:
-        """Update the ROI preview label with a crop of the pending bbox."""
+        """Update the ROI preview label with a 2× crop of the pending bbox."""
         if self._pending_bbox is None:
             self._roi_preview.clear()
             return
@@ -542,14 +696,20 @@ class CalibrationOverlay(QWidget):
         y2 = min(y + h, fh)
         x = max(0, x)
         y = max(0, y)
-        roi = self._frame[y:y2, x:x2]
+        roi = np.ascontiguousarray(self._frame[y:y2, x:x2])
         if roi.size == 0:
             return
         rh, rw, rch = roi.shape
         bpl = rch * rw
         qimg = QImage(roi.data, rw, rh, bpl, QImage.Format.Format_BGR888)
         pm = QPixmap.fromImage(qimg)
-        self._roi_preview.setPixmap(pm)
+        zoomed = pm.scaled(
+            rw * 2,
+            rh * 2,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._roi_preview.setPixmap(zoomed)
 
     def _update_button_states(self) -> None:
         """Enable/disable buttons based on current state."""

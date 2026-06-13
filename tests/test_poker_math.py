@@ -14,6 +14,9 @@ from riverrater.game.poker_math import (
     calculate_pot_odds,
     calculate_ev,
     analyze_poker,
+    clear_equity_cache,
+    recompute_poker_ev,
+    _cached_equity,
     HAND_HIGH_CARD,
     HAND_PAIR,
     HAND_TWO_PAIR,
@@ -356,3 +359,61 @@ class TestAnalyzePoker:
         result = analyze_poker(state)
         expected = result.win_pct + result.tie_pct / 2.0
         assert abs(result.actual_equity - expected) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# test_equity_cache_and_recompute
+# ---------------------------------------------------------------------------
+
+class TestEquityCacheAndRecompute:
+    def setup_method(self) -> None:
+        clear_equity_cache()
+
+    def test_calculate_equity_uses_lru_cache(self) -> None:
+        hole = cards("Ah", "Ad")
+        community: list[Card] = []
+        random.seed(99)
+        first = calculate_equity(hole, community, num_opponents=1, simulations=5000)
+        random.seed(0)
+        second = calculate_equity(hole, community, num_opponents=1, simulations=5000)
+        assert first == second
+        assert _cached_equity.cache_info().hits >= 1
+
+    def test_clear_equity_cache(self) -> None:
+        hole = cards("Kh", "Kd")
+        calculate_equity(hole, [], num_opponents=1, simulations=1000)
+        assert _cached_equity.cache_info().currsize >= 1
+        clear_equity_cache()
+        assert _cached_equity.cache_info().currsize == 0
+
+    def test_recompute_poker_ev_skips_monte_carlo(self) -> None:
+        result = recompute_poker_ev(0.60, 0.10, pot_size=200.0, bet_to_call=50.0)
+        assert result.win_pct == 0.60
+        assert result.tie_pct == 0.10
+        assert result.actual_equity == pytest.approx(0.65)
+        assert result.required_equity == pytest.approx(50 / 250)
+        assert result.ev_fold == 0.0
+        assert result.recommended_action in list(PokerAction)
+
+    def test_recompute_matches_analyze_for_same_equity(self) -> None:
+        random.seed(5)
+        state = PokerState(
+            hole_cards=cards("Ah", "Kd"),
+            community_cards=cards("2c", "7d", "9s"),
+            pot_size=150.0,
+            bet_to_call=30.0,
+            num_opponents=1,
+        )
+        full = analyze_poker(state)
+        fast = recompute_poker_ev(
+            full.win_pct,
+            full.tie_pct,
+            state.pot_size,
+            state.bet_to_call,
+        )
+        assert fast.win_pct == full.win_pct
+        assert fast.tie_pct == full.tie_pct
+        assert fast.required_equity == full.required_equity
+        assert fast.ev_call == full.ev_call
+        assert fast.ev_raise == full.ev_raise
+        assert fast.recommended_action == full.recommended_action

@@ -43,9 +43,10 @@ class HUDOverlay(QMainWindow):
         overlay.show()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, num_opponents: int = 1) -> None:
         super().__init__()
         self._drag_position: Optional[QPoint] = None
+        self._initial_num_opponents = num_opponents
         self._setup_window()
         self._setup_ui()
 
@@ -70,7 +71,7 @@ class HUDOverlay(QMainWindow):
         self._stack = QStackedWidget()
         self._stack.setObjectName("HUDStack")
 
-        self._poker_view = PokerView()
+        self._poker_view = PokerView(num_opponents=self._initial_num_opponents)
         self._blackjack_view = BlackjackView()
 
         self._stack.insertWidget(_PAGE_POKER, self._poker_view)
@@ -98,6 +99,11 @@ class HUDOverlay(QMainWindow):
             logger.debug("HUD switched to blackjack mode.")
         else:
             logger.warning("Unknown GameMode: %s", mode)
+
+    @property
+    def poker_view(self) -> PokerView:
+        """Direct access to the embedded poker HUD panel."""
+        return self._poker_view
 
     def update_poker(self, result: PokerResult) -> None:
         """Push a :class:`PokerResult` to the poker view.

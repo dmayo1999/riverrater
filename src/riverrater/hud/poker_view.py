@@ -10,17 +10,19 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from riverrater.game.state import DetectionMeta, PokerAction, PokerResult
+from riverrater.hud.poker_input import MAX_OPPONENTS, MIN_OPPONENTS, OpponentStepper
 
 logger = logging.getLogger(__name__)
 
@@ -54,16 +56,26 @@ class PokerView(QWidget):
     """Compact poker analysis panel displayed inside the HUD overlay.
 
     Sections (top to bottom):
-    - Title bar: "♠ POKER" + status dot
+    - Title bar: "♠ POKER" + active opponent count + stepper + status dot
     - Win % (large, colour-coded vs required equity)
     - Tie %, Required Equity
     - EV Call / EV Fold
     - Recommendation pill (CALL ✓ / FOLD ✗ / RAISE)
     """
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    num_opponents_changed = pyqtSignal(int)
+    degradation_fix_requested = pyqtSignal(str)
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        num_opponents: int = MIN_OPPONENTS,
+    ) -> None:
         super().__init__(parent)
+        self._num_opponents = MIN_OPPONENTS
         self._setup_ui()
+        self.set_num_opponents(num_opponents)
         self._show_no_data()
 
     # ------------------------------------------------------------------
@@ -102,6 +114,14 @@ class PokerView(QWidget):
             """
         )
 
+        self._opp_count_label = QLabel()
+        self._opp_count_label.setStyleSheet(
+            f"color: {_CLR_MUTED}; font-size: 10px; font-weight: 600;"
+        )
+
+        self._opp_stepper = OpponentStepper(compact=True)
+        self._opp_stepper.value_changed.connect(self._on_opponents_changed)
+
         self._status_dot = QLabel("●")
         self._status_dot.setStyleSheet(
             f"color: {_CLR_MUTED}; font-size: 9px;"
@@ -115,6 +135,8 @@ class PokerView(QWidget):
         self._confidence_dot.hide()
 
         title_row.addWidget(self._title_label)
+        title_row.addWidget(self._opp_count_label)
+        title_row.addWidget(self._opp_stepper)
         title_row.addStretch()
         title_row.addWidget(self._confidence_dot)
         title_row.addWidget(self._status_dot)
@@ -139,6 +161,47 @@ class PokerView(QWidget):
         )
         self._warning_label.hide()
         root.addWidget(self._warning_label)
+
+        # -- Vision degradation banner (severe confidence loss) --------------
+        self._degradation_widget = QWidget()
+        degradation_layout = QHBoxLayout(self._degradation_widget)
+        degradation_layout.setContentsMargins(6, 4, 6, 4)
+        degradation_layout.setSpacing(8)
+
+        self._degradation_label = QLabel(
+            "\u26a0 Vision degraded \u2014 detection unreliable"
+        )
+        self._degradation_label.setStyleSheet(
+            f"color: {_CLR_RED}; font-size: 11px; font-weight: 600;"
+        )
+
+        self._degradation_fix_btn = QPushButton("Fix")
+        self._degradation_fix_btn.setFixedHeight(24)
+        self._degradation_fix_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                color: {_CLR_WHITE};
+                background-color: rgba(200, 20, 30, 200);
+                border: none;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 0px 10px;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(230, 40, 50, 220);
+            }}
+            """
+        )
+        self._degradation_fix_btn.clicked.connect(self._on_degradation_fix_clicked)
+
+        degradation_layout.addWidget(self._degradation_label, stretch=1)
+        degradation_layout.addWidget(self._degradation_fix_btn)
+        self._degradation_widget.setStyleSheet(
+            "background-color: rgba(80, 20, 30, 160); border-radius: 4px;"
+        )
+        self._degradation_widget.hide()
+        root.addWidget(self._degradation_widget)
 
         # -- No-data placeholder ---------------------------------------------
         self._no_data_label = QLabel("Waiting for cards...")
@@ -241,6 +304,27 @@ class PokerView(QWidget):
     # Public interface
     # ------------------------------------------------------------------
 
+    @property
+    def num_opponents(self) -> int:
+        return self._num_opponents
+
+    def set_num_opponents(self, value: int) -> None:
+        """Update HUD opponent count display and stepper without emitting."""
+        self._num_opponents = max(MIN_OPPONENTS, min(MAX_OPPONENTS, int(value)))
+        self._opp_stepper.blockSignals(True)
+        self._opp_stepper.set_value(self._num_opponents)
+        self._opp_stepper.blockSignals(False)
+        self._update_opponent_label()
+
+    def _on_opponents_changed(self, value: int) -> None:
+        self._num_opponents = value
+        self._update_opponent_label()
+        self.num_opponents_changed.emit(value)
+
+    def _update_opponent_label(self) -> None:
+        suffix = "OPP" if self._num_opponents == 1 else "OPPS"
+        self._opp_count_label.setText(f"{self._num_opponents} {suffix}")
+
     def update(self, result: PokerResult) -> None:  # type: ignore[override]
         """Refresh all labels from a :class:`PokerResult`.
 
@@ -308,12 +392,20 @@ class PokerView(QWidget):
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _on_degradation_fix_clicked(self) -> None:
+        """Emit fix action — calibrate when vision failed, else manual input."""
+        action = "calibrate"
+        if self._degradation_label.property("fix_action") == "poker_input":
+            action = "poker_input"
+        self.degradation_fix_requested.emit(action)
+
     def _update_confidence(self, meta: "DetectionMeta | None") -> None:
         """Update confidence dot, card detection row, and warning banner."""
         if meta is None:
             self._confidence_dot.hide()
             self._card_detection_label.hide()
             self._warning_label.hide()
+            self._degradation_widget.hide()
             return
 
         # Confidence dot color
@@ -334,6 +426,7 @@ class PokerView(QWidget):
             )
             self._card_detection_label.show()
             self._warning_label.hide()
+            self._degradation_widget.hide()
         elif meta.card_confidences:
             parts = []
             for card_str, conf in meta.card_confidences.items():
@@ -355,15 +448,30 @@ class PokerView(QWidget):
             # Warning banner — show if any card < 0.7
             has_low = any(c < 0.7 for c in meta.card_confidences.values())
             self._warning_label.setVisible(has_low)
+
+            # Degradation banner — severe vision loss (< 0.5 overall)
+            is_degraded = meta.overall_confidence < 0.5
+            if is_degraded:
+                self._degradation_label.setProperty("fix_action", "calibrate")
+                self._degradation_widget.show()
+            else:
+                self._degradation_widget.hide()
         else:
             self._card_detection_label.hide()
             self._warning_label.hide()
+            self._degradation_widget.hide()
+
+    def show_no_vision_degradation(self, *, fix_action: str = "calibrate") -> None:
+        """Show degradation banner when no cards are detected (missing profile)."""
+        self._degradation_label.setProperty("fix_action", fix_action)
+        self._degradation_widget.show()
 
     def _show_no_data(self) -> None:
         self._status_dot.setStyleSheet(f"color: {_CLR_MUTED}; font-size: 9px;")
         self._confidence_dot.hide()
         self._card_detection_label.hide()
         self._warning_label.hide()
+        self._degradation_widget.hide()
         self._no_data_label.show()
         self._data_widget.hide()
 

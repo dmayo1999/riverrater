@@ -12,7 +12,10 @@ venv/
 env/
 models/yolov8n_cards/best.pt
 data/templates/
-data/training/
+data/training/*
+!data/training/README.md
+!data/training/cards.yaml
+!data/training/**/.gitkeep
 *.npz
 ~/.riverrater/
 .DS_Store

@@ -1,18 +1,16 @@
 """
-YOLO-based card detection engine stub for RiverRater.
+YOLO-based card detection engine for RiverRater.
 
 This module provides :class:`YOLOEngine`, which implements the same
 ``detect_cards`` interface as :class:`~riverrater.vision.template_engine.TemplateEngine`.
 
-Current status
---------------
-The YOLO model has not yet been trained.  This stub:
-
+Behaviour
+---------
 * Attempts to load a model file at ``model_path`` if one is provided.
 * Returns an empty list from ``detect_cards`` when no model is available.
 * Never raises an exception from ``detect_cards`` — callers should check
-  :attr:`is_available` first and fall back to template matching or manual
-  input when it is ``False``.
+  :attr:`is_available` first and fall back to manual input when it is
+  ``False``.
 
 Integration path (fill in when a trained model is available)
 -------------------------------------------------------------
@@ -98,7 +96,7 @@ def _build_class_map() -> dict[int, tuple[Rank, Suit]]:
 
 class YOLOEngine:
     """
-    YOLOv8-based card detection engine (stub).
+    YOLOv8-based card detection engine.
 
     Implements the same ``detect_cards`` interface as
     :class:`~riverrater.vision.template_engine.TemplateEngine` so the two

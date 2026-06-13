@@ -5,6 +5,8 @@ poker_math.py — Monte Carlo equity calculator and EV analysis for RiverRater.
 from __future__ import annotations
 
 import random
+from collections import Counter, defaultdict
+from functools import lru_cache
 from itertools import combinations
 from typing import Optional
 
@@ -56,11 +58,6 @@ HAND_ROYAL_FLUSH = 9
 # Hand evaluation
 # ---------------------------------------------------------------------------
 
-def _rank_values(cards: list[Card]) -> list[int]:
-    """Return sorted (descending) rank values for a set of cards."""
-    return sorted([_RANK_ORDER[c.rank] for c in cards], reverse=True)
-
-
 def _best_straight(values: list[int]) -> Optional[int]:
     """Return the highest straight top card from a sorted list of unique values, or None.
 
@@ -83,15 +80,92 @@ def evaluate_hand(cards: list[Card]) -> tuple[int, list[int]]:
     Returns (hand_rank, kickers) where hand_rank is 0 (high card) – 9 (royal flush)
     and kickers is a list of integers used to break ties, highest first.
     """
-    if len(cards) < 5:
-        raise ValueError(f"Need at least 5 cards, got {len(cards)}")
+    n = len(cards)
+    if n < 5:
+        raise ValueError(f"Need at least 5 cards, got {n}")
+    if n == 5:
+        return _evaluate_five(cards)
+    if n == 7:
+        return _evaluate_seven(cards)
 
     best: Optional[tuple[int, list[int]]] = None
-
     for combo in combinations(cards, 5):
         result = _evaluate_five(list(combo))
         if best is None or result > best:
             best = result
+
+    assert best is not None
+    return best
+
+
+def _evaluate_seven(cards: list[Card]) -> tuple[int, list[int]]:
+    """Best 5-card hand from exactly 7 cards without brute-force combinations."""
+    values = [_RANK_ORDER[c.rank] for c in cards]
+    counts = Counter(values)
+    unique_desc = sorted(counts.keys(), reverse=True)
+
+    best: Optional[tuple[int, list[int]]] = None
+
+    def consider(result: tuple[int, list[int]]) -> None:
+        nonlocal best
+        if best is None or result > best:
+            best = result
+
+    by_suit: dict[Suit, list[int]] = defaultdict(list)
+    for card in cards:
+        by_suit[card.suit].append(_RANK_ORDER[card.rank])
+
+    for suited_vals in by_suit.values():
+        if len(suited_vals) < 5:
+            continue
+        top_five = sorted(suited_vals, reverse=True)[:5]
+        unique_suited = sorted(set(suited_vals), reverse=True)
+        straight_top = _best_straight(unique_suited)
+        if straight_top is not None:
+            if straight_top == 14 and {10, 11, 12, 13, 14}.issubset(set(suited_vals)):
+                consider((HAND_ROYAL_FLUSH, [14]))
+            else:
+                consider((HAND_STRAIGHT_FLUSH, [straight_top]))
+        consider((HAND_FLUSH, top_five))
+
+    straight_top = _best_straight(unique_desc)
+    if straight_top is not None:
+        consider((HAND_STRAIGHT, [straight_top]))
+
+    groups = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
+
+    if groups[0][1] >= 4:
+        quad_rank = groups[0][0]
+        kicker = max(r for r in unique_desc if r != quad_rank)
+        consider((HAND_FOUR_OF_A_KIND, [quad_rank, kicker]))
+
+    for trips_rank in unique_desc:
+        if counts[trips_rank] < 3:
+            continue
+        for pair_rank in unique_desc:
+            if pair_rank == trips_rank:
+                continue
+            if counts[pair_rank] >= 2:
+                consider((HAND_FULL_HOUSE, [trips_rank, pair_rank]))
+
+    pair_ranks = [rank for rank, cnt in groups if cnt >= 2]
+    if len(pair_ranks) >= 2:
+        pair1, pair2 = pair_ranks[0], pair_ranks[1]
+        kickers = [r for r in unique_desc if r not in (pair1, pair2)]
+        if kickers:
+            consider((HAND_TWO_PAIR, [pair1, pair2, kickers[0]]))
+
+    if groups[0][1] >= 3:
+        trips_rank = groups[0][0]
+        kickers = [r for r in unique_desc if r != trips_rank][:2]
+        consider((HAND_THREE_OF_A_KIND, [trips_rank] + kickers))
+
+    if groups[0][1] >= 2:
+        pair_rank = groups[0][0]
+        kickers = [r for r in unique_desc if r != pair_rank][:3]
+        consider((HAND_PAIR, [pair_rank] + kickers))
+
+    consider((HAND_HIGH_CARD, sorted(values, reverse=True)[:5]))
 
     assert best is not None
     return best
@@ -107,8 +181,6 @@ def _evaluate_five(cards: list[Card]) -> tuple[int, list[int]]:
     straight_top = _best_straight(unique_values)
     is_straight = straight_top is not None
 
-    # Count occurrences
-    from collections import Counter
     counts = Counter(values)
     # Sort by (count desc, rank desc) for kicker ordering
     groups = sorted(counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
@@ -158,16 +230,23 @@ def _evaluate_five(cards: list[Card]) -> tuple[int, list[int]]:
 # Monte Carlo equity
 # ---------------------------------------------------------------------------
 
-def calculate_equity(
-    hole_cards: list[Card],
-    community_cards: list[Card],
-    num_opponents: int = 1,
-    simulations: int = 5000,
-) -> tuple[float, float]:
-    """Monte Carlo simulation of poker equity.
+def _cards_from_keys(hole_key: tuple[str, ...], community_key: tuple[str, ...]) -> tuple[list[Card], list[Card]]:
+    """Reconstruct card lists from hashable string keys."""
+    return (
+        [Card.from_string(s) for s in hole_key],
+        [Card.from_string(s) for s in community_key],
+    )
 
-    Returns (win_pct, tie_pct) as floats in [0, 1].
-    """
+
+@lru_cache(maxsize=128)
+def _cached_equity(
+    hole_key: tuple[str, ...],
+    community_key: tuple[str, ...],
+    num_opponents: int,
+    simulations: int,
+) -> tuple[float, float]:
+    """Hashable Monte Carlo equity cache keyed by card strings."""
+    hole_cards, community_cards = _cards_from_keys(hole_key, community_key)
     known_cards = set(hole_cards + community_cards)
     remaining_deck = [c for c in FULL_DECK if c not in known_cards]
 
@@ -175,30 +254,25 @@ def calculate_equity(
     ties = 0
     total = 0
 
+    needed_community = 5 - len(community_cards)
+    cards_to_deal = needed_community + num_opponents * 2
+    if cards_to_deal > len(remaining_deck):
+        return (0.0, 0.0)
+
     for _ in range(simulations):
-        deck_copy = remaining_deck.copy()
-        random.shuffle(deck_copy)
+        dealt = random.sample(remaining_deck, cards_to_deal)
+        sim_community = community_cards + dealt[:needed_community]
+        opponent_cards = dealt[needed_community:]
 
-        # Deal remaining community cards
-        needed_community = 5 - len(community_cards)
-        if needed_community > len(deck_copy):
-            continue
-        sim_community = community_cards + deck_copy[:needed_community]
-        deck_copy = deck_copy[needed_community:]
-
-        # Deal opponent hands
-        if len(deck_copy) < num_opponents * 2:
-            continue
-        opponent_hands: list[list[Card]] = []
-        for i in range(num_opponents):
-            opp_hand = deck_copy[i * 2: i * 2 + 2]
-            opponent_hands.append(opp_hand)
-
-        # Evaluate player hand
         player_best = evaluate_hand(hole_cards + sim_community)
 
-        # Evaluate opponent hands and find best opponent
-        best_opp = max(evaluate_hand(opp + sim_community) for opp in opponent_hands)
+        best_opp = None
+        for i in range(num_opponents):
+            opp_hand = opponent_cards[i * 2: i * 2 + 2]
+            opp_best = evaluate_hand(opp_hand + sim_community)
+            if best_opp is None or opp_best > best_opp:
+                best_opp = opp_best
+        assert best_opp is not None
 
         total += 1
         if player_best > best_opp:
@@ -210,6 +284,26 @@ def calculate_equity(
         return (0.0, 0.0)
 
     return (wins / total, ties / total)
+
+
+def clear_equity_cache() -> None:
+    """Clear the LRU cache backing :func:`calculate_equity`."""
+    _cached_equity.cache_clear()
+
+
+def calculate_equity(
+    hole_cards: list[Card],
+    community_cards: list[Card],
+    num_opponents: int = 1,
+    simulations: int = 5000,
+) -> tuple[float, float]:
+    """Monte Carlo simulation of poker equity.
+
+    Returns (win_pct, tie_pct) as floats in [0, 1].
+    """
+    hole_key = tuple(str(c) for c in hole_cards)
+    community_key = tuple(str(c) for c in community_cards)
+    return _cached_equity(hole_key, community_key, num_opponents, simulations)
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +346,36 @@ def calculate_ev(
 # ---------------------------------------------------------------------------
 # Full analysis pipeline
 # ---------------------------------------------------------------------------
+
+def recompute_poker_ev(
+    win_pct: float,
+    tie_pct: float,
+    pot_size: float,
+    bet_to_call: float,
+) -> PokerResult:
+    """Recompute pot odds and EV from cached equity — skips Monte Carlo."""
+    actual_equity = win_pct + tie_pct / 2.0
+    required_equity = calculate_pot_odds(pot_size, bet_to_call)
+    ev_call, ev_fold, ev_raise = calculate_ev(win_pct, pot_size, bet_to_call)
+
+    evs = {
+        PokerAction.CALL: ev_call,
+        PokerAction.FOLD: ev_fold,
+        PokerAction.RAISE: ev_raise,
+    }
+    recommended_action = max(evs, key=lambda a: evs[a])
+
+    return PokerResult(
+        win_pct=win_pct,
+        tie_pct=tie_pct,
+        required_equity=required_equity,
+        actual_equity=actual_equity,
+        ev_call=ev_call,
+        ev_fold=ev_fold,
+        ev_raise=ev_raise,
+        recommended_action=recommended_action,
+    )
+
 
 def analyze_poker(state: PokerState) -> PokerResult:
     """Run full poker analysis and return a populated PokerResult."""

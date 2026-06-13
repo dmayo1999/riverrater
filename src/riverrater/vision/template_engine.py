@@ -32,6 +32,9 @@ _IOU_THRESHOLD = 0.3
 # Key used in the .npz archive.
 _NPZ_KEY_PREFIX = "card_"
 
+# Extra pixels added around each saved card-slot ROI before template matching.
+_ROI_PADDING = 8
+
 
 def _compute_iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
     """
@@ -108,6 +111,30 @@ def _nms(
     return kept
 
 
+def _padded_roi(
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    frame_w: int,
+    frame_h: int,
+    padding: int = _ROI_PADDING,
+) -> tuple[int, int, int, int]:
+    """
+    Expand an ROI by *padding* pixels and clamp to the frame bounds.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        ``(x, y, w, h)`` of the padded, clamped region.
+    """
+    x1 = max(0, x - padding)
+    y1 = max(0, y - padding)
+    x2 = min(frame_w, x + w + padding)
+    y2 = min(frame_h, y + h + padding)
+    return x1, y1, x2 - x1, y2 - y1
+
+
 class TemplateEngine:
     """
     Card detection engine based on OpenCV template matching.
@@ -125,9 +152,34 @@ class TemplateEngine:
     def __init__(self, profile_path: Optional[str] = None) -> None:
         # Dict mapping Card -> list of grayscale template images.
         self._templates: dict[Card, list[np.ndarray]] = defaultdict(list)
+        # Optional per-slot search regions from calibration (x, y, w, h).
+        self._roi_regions: list[tuple[int, int, int, int]] = []
 
         if profile_path is not None:
             self.load_profile(profile_path)
+
+    @property
+    def roi_regions(self) -> list[tuple[int, int, int, int]]:
+        """Card-slot ROIs loaded from calibration; empty means full-frame search."""
+        return list(self._roi_regions)
+
+    @property
+    def uses_roi_scoped_search(self) -> bool:
+        """True when detection is limited to saved card-slot regions."""
+        return bool(self._roi_regions)
+
+    def set_roi_regions(self, regions: list[tuple[int, int, int, int]]) -> None:
+        """
+        Define card-slot search regions for :meth:`detect_cards`.
+
+        Parameters
+        ----------
+        regions:
+            List of ``(x, y, w, h)`` bounding boxes in frame coordinates.
+            An empty list restores full-frame matching.
+        """
+        self._roi_regions = list(regions)
+        logger.debug("Set %d ROI region(s) for scoped card search.", len(self._roi_regions))
 
     # ------------------------------------------------------------------ #
     # Template management
@@ -201,34 +253,75 @@ class TemplateEngine:
         gray_frame = _to_gray(frame)
         candidates: list[tuple[Card, tuple[int, int, int, int], float]] = []
 
-        for card, templates in self._templates.items():
-            for tmpl in templates:
-                tmpl_h, tmpl_w = tmpl.shape[:2]
-                if tmpl_h == 0 or tmpl_w == 0:
-                    continue
-
-                for scale in _SCALES:
-                    new_h = max(1, int(gray_frame.shape[0] * scale))
-                    new_w = max(1, int(gray_frame.shape[1] * scale))
-                    resized = cv2.resize(gray_frame, (new_w, new_h))
-
-                    # Template must be smaller than the search image.
-                    if resized.shape[0] < tmpl_h or resized.shape[1] < tmpl_w:
+        for search_gray, offset_x, offset_y in self._iter_search_areas(gray_frame):
+            for card, templates in self._templates.items():
+                for tmpl in templates:
+                    tmpl_h, tmpl_w = tmpl.shape[:2]
+                    if tmpl_h == 0 or tmpl_w == 0:
                         continue
 
-                    result = cv2.matchTemplate(resized, tmpl, cv2.TM_CCOEFF_NORMED)
-                    loc = np.where(result >= confidence)
+                    for scale in _SCALES:
+                        new_h = max(1, int(search_gray.shape[0] * scale))
+                        new_w = max(1, int(search_gray.shape[1] * scale))
+                        resized = cv2.resize(search_gray, (new_w, new_h))
 
-                    for py, px in zip(*loc):
-                        score = float(result[py, px])
-                        # Map coordinates back to original frame space.
-                        orig_x = int(px / scale)
-                        orig_y = int(py / scale)
-                        orig_w = int(tmpl_w / scale)
-                        orig_h = int(tmpl_h / scale)
-                        candidates.append((card, (orig_x, orig_y, orig_w, orig_h), score))
+                        # Template must be smaller than the search image.
+                        if resized.shape[0] < tmpl_h or resized.shape[1] < tmpl_w:
+                            continue
+
+                        result = cv2.matchTemplate(resized, tmpl, cv2.TM_CCOEFF_NORMED)
+                        if self.uses_roi_scoped_search:
+                            # One card per calibrated slot — peak match is enough.
+                            _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+                            if max_val >= confidence:
+                                px, py = max_loc
+                                score = float(max_val)
+                                orig_x = int(px / scale) + offset_x
+                                orig_y = int(py / scale) + offset_y
+                                orig_w = int(tmpl_w / scale)
+                                orig_h = int(tmpl_h / scale)
+                                candidates.append(
+                                    (card, (orig_x, orig_y, orig_w, orig_h), score)
+                                )
+                        else:
+                            loc = np.where(result >= confidence)
+                            for py, px in zip(*loc):
+                                score = float(result[py, px])
+                                orig_x = int(px / scale) + offset_x
+                                orig_y = int(py / scale) + offset_y
+                                orig_w = int(tmpl_w / scale)
+                                orig_h = int(tmpl_h / scale)
+                                candidates.append(
+                                    (card, (orig_x, orig_y, orig_w, orig_h), score)
+                                )
 
         return _nms(candidates)
+
+    def _iter_search_areas(
+        self,
+        gray_frame: np.ndarray,
+    ) -> list[tuple[np.ndarray, int, int]]:
+        """
+        Yield search images for template matching.
+
+        When card-slot ROIs are configured, each ROI (with padding) is cropped
+        from *gray_frame*.  Otherwise the full frame is searched once.
+        """
+        if not self._roi_regions:
+            return [(gray_frame, 0, 0)]
+
+        frame_h, frame_w = gray_frame.shape[:2]
+        areas: list[tuple[np.ndarray, int, int]] = []
+        for x, y, w, h in self._roi_regions:
+            if w <= 0 or h <= 0:
+                continue
+            roi_x, roi_y, roi_w, roi_h = _padded_roi(x, y, w, h, frame_w, frame_h)
+            crop = gray_frame[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
+            if crop.size == 0:
+                continue
+            areas.append((crop, roi_x, roi_y))
+
+        return areas
 
     # ------------------------------------------------------------------ #
     # Profile persistence
@@ -270,6 +363,21 @@ class TemplateEngine:
         meta_path = profile_dir / "metadata.json"
         with meta_path.open("w", encoding="utf-8") as fh:
             json.dump(metadata, fh, indent=2)
+
+        regions_path = profile_dir / "regions.json"
+        if self._roi_regions:
+            regions_payload: dict[str, object] = {
+                "card_slots": [list(region) for region in self._roi_regions],
+            }
+            existing_pot, existing_bet = self._read_pot_bet_rois(regions_path)
+            if existing_pot is not None:
+                regions_payload["pot_roi"] = list(existing_pot)
+            if existing_bet is not None:
+                regions_payload["bet_roi"] = list(existing_bet)
+            with regions_path.open("w", encoding="utf-8") as fh:
+                json.dump(regions_payload, fh, indent=2)
+        elif regions_path.exists():
+            regions_path.unlink()
 
         logger.info("Saved profile to %s (%d cards)", path, len(metadata))
 
@@ -314,7 +422,59 @@ class TemplateEngine:
                 else:
                     logger.warning("Key %s missing from npz archive; skipping.", key)
 
-        logger.info("Loaded profile from %s (%d cards)", path, len(self._templates))
+        self._roi_regions = self._load_roi_regions(profile_dir)
+
+        logger.info(
+            "Loaded profile from %s (%d cards, %d ROI region(s))",
+            path,
+            len(self._templates),
+            len(self._roi_regions),
+        )
+
+    def _load_roi_regions(self, profile_dir: Path) -> list[tuple[int, int, int, int]]:
+        """Load optional card-slot regions saved during calibration."""
+        regions_path = profile_dir / "regions.json"
+        if not regions_path.exists():
+            return []
+
+        with regions_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+
+        raw_regions = payload.get("card_slots", [])
+        regions: list[tuple[int, int, int, int]] = []
+        for entry in raw_regions:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 4:
+                logger.warning("Skipping invalid ROI entry in %s: %r", regions_path, entry)
+                continue
+            x, y, w, h = (int(v) for v in entry)
+            if w > 0 and h > 0:
+                regions.append((x, y, w, h))
+
+        return regions
+
+    @staticmethod
+    def _read_pot_bet_rois(
+        regions_path: Path,
+    ) -> tuple[Optional[tuple[int, int, int, int]], Optional[tuple[int, int, int, int]]]:
+        """Preserve pot/bet ROIs already stored in regions.json."""
+        if not regions_path.exists():
+            return None, None
+
+        with regions_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+
+        pot_roi = TemplateEngine._parse_optional_roi(payload.get("pot_roi"))
+        bet_roi = TemplateEngine._parse_optional_roi(payload.get("bet_roi"))
+        return pot_roi, bet_roi
+
+    @staticmethod
+    def _parse_optional_roi(entry: object) -> Optional[tuple[int, int, int, int]]:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 4:
+            return None
+        x, y, w, h = (int(v) for v in entry)
+        if w <= 0 or h <= 0:
+            return None
+        return x, y, w, h
 
 
 # ---------------------------------------------------------------------------

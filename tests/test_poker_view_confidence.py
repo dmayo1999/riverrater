@@ -2,6 +2,7 @@
 
 import pytest
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 from riverrater.game.state import DetectionMeta, PokerAction, PokerResult
@@ -18,9 +19,10 @@ def qapp():
 
 
 @pytest.fixture
-def poker_view(qapp):
+def poker_view(qapp, qtbot):
     """Create a fresh PokerView for each test."""
     view = PokerView()
+    qtbot.addWidget(view)
     return view
 
 
@@ -120,3 +122,38 @@ def test_low_confidence_warning_hidden(poker_view):
     )
     poker_view.update(_make_result(detection_meta=meta))
     assert poker_view._warning_label.isHidden()
+
+
+def test_degradation_banner_shown_when_severe(poker_view):
+    """Degradation banner visible when overall confidence < 0.5."""
+    meta = DetectionMeta(
+        card_confidences={"Ah": 0.40, "Kd": 0.45},
+        overall_confidence=0.425,
+    )
+    poker_view.update(_make_result(detection_meta=meta))
+    assert not poker_view._degradation_widget.isHidden()
+
+
+def test_degradation_banner_hidden_when_ok(poker_view):
+    """Degradation banner hidden when confidence is acceptable."""
+    meta = DetectionMeta(
+        card_confidences={"Ah": 0.90, "Kd": 0.88},
+        overall_confidence=0.89,
+    )
+    poker_view.update(_make_result(detection_meta=meta))
+    assert poker_view._degradation_widget.isHidden()
+
+
+def test_degradation_fix_emits_signal(poker_view, qtbot):
+    """Fix button emits degradation_fix_requested with action."""
+    received: list[str] = []
+    poker_view.degradation_fix_requested.connect(received.append)
+
+    meta = DetectionMeta(
+        card_confidences={"Ah": 0.40},
+        overall_confidence=0.40,
+    )
+    poker_view.update(_make_result(detection_meta=meta))
+    qtbot.mouseClick(poker_view._degradation_fix_btn, Qt.MouseButton.LeftButton)
+
+    assert received == ["calibrate"]

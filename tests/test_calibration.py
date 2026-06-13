@@ -264,6 +264,18 @@ class TestCalibrationSessionFlow:
         assert ah in engine._templates
         assert ks in engine._templates
 
+    def test_finish_sets_roi_regions_from_unique_bboxes(self) -> None:
+        session = CalibrationSession()
+        frame = self._make_frame_with_card((200, 100, 50), (20, 30), (50, 70))
+        session.add_calibration("Ah", (30, 20, 70, 50), frame)
+        session.add_calibration("Ks", (120, 20, 70, 50), frame)
+
+        engine = TemplateEngine()
+        session.finish(engine)
+
+        assert engine.roi_regions == [(30, 20, 70, 50), (120, 20, 70, 50)]
+        assert engine.uses_roi_scoped_search is True
+
     def test_finish_clears_pending(self) -> None:
         session = CalibrationSession()
         frame = np.zeros((100, 100, 3), dtype=np.uint8)

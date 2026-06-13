@@ -1,0 +1,73 @@
+# YOLOv8 dataset configuration for RiverRater card detection.
+#
+# Class order matches riverrater.vision.yolo_engine.YOLOEngine.CLASS_MAP:
+# rank 2→A, suit c→d→h→s (e.g. 0=2c, 1=2d, …, 51=As).
+#
+# Before training on Google Colab, set `path` to the absolute dataset root
+# (the folder that contains augmented/ and raw/).
+
+path: .
+train: augmented/images
+val: raw/valid/images
+test: raw/test/images
+
+nc: 52
+names:
+  - 2c
+  - 2d
+  - 2h
+  - 2s
+  - 3c
+  - 3d
+  - 3h
+  - 3s
+  - 4c
+  - 4d
+  - 4h
+  - 4s
+  - 5c
+  - 5d
+  - 5h
+  - 5s
+  - 6c
+  - 6d
+  - 6h
+  - 6s
+  - 7c
+  - 7d
+  - 7h
+  - 7s
+  - 8c
+  - 8d
+  - 8h
+  - 8s
+  - 9c
+  - 9d
+  - 9h
+  - 9s
+  - Tc
+  - Td
+  - Th
+  - Ts
+  - Jc
+  - Jd
+  - Jh
+  - Js
+  - Qc
+  - Qd
+  - Qh
+  - Qs
+  - Kc
+  - Kd
+  - Kh
+  - Ks
+  - Ac
+  - Ad
+  - Ah
+  - As
+
+# Colab training example:
+#   !pip install ultralytics
+#   from ultralytics import YOLO
+#   model = YOLO("yolov8n.pt")
+#   model.train(data="/content/data/training/cards.yaml", epochs=100, imgsz=640)

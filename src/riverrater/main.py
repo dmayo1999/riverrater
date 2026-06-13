@@ -54,21 +54,25 @@ from riverrater.game.state import (
 )
 
 # -- Math engines ------------------------------------------------------------
-from riverrater.game.poker_math import analyze_poker
+from riverrater.game.poker_math import analyze_poker, clear_equity_cache, recompute_poker_ev
 from riverrater.game.blackjack_math import analyze_blackjack
 
 # -- Screen capture ----------------------------------------------------------
 from riverrater.capture.screen import ScreenCapture
 
 # -- Vision engines ----------------------------------------------------------
+from riverrater.training.yolo_train import default_weights_path
+from riverrater.vision.card_tracker import CardTracker
 from riverrater.vision.template_engine import TemplateEngine
 from riverrater.vision.yolo_engine import YOLOEngine
+from riverrater.vision.pot_ocr import PotOCR, resolve_pot_rois
 
 # -- HUD overlay -------------------------------------------------------------
 try:
     from riverrater.hud.overlay import HUDOverlay
     from riverrater.hud.manual_input import ManualCardInput
     from riverrater.hud.poker_input import PokerInputDialog
+    from riverrater.hud.settings_dialog import SettingsDialog
     _HAS_HUD = True
 except ImportError as _e:
     logger.warning("hud not available: %s", _e)
@@ -76,6 +80,7 @@ except ImportError as _e:
     HUDOverlay = None  # type: ignore[assignment,misc]
     ManualCardInput = None  # type: ignore[assignment,misc]
     PokerInputDialog = None  # type: ignore[assignment,misc]
+    SettingsDialog = None  # type: ignore[assignment,misc]
 
 try:
     from riverrater.hud.calibration_overlay import CalibrationOverlay
@@ -87,6 +92,7 @@ except ImportError as _e:
 
 # -- Hotkeys -----------------------------------------------------------------
 from riverrater.utils.hotkeys import HotkeyManager
+from riverrater.utils.session_log import SessionLogger
 
 # ---------------------------------------------------------------------------
 # Config
@@ -114,6 +120,12 @@ class AppConfig:
     # Vision
     vision_profile: str = "default"
     detection_confidence: float = 0.8
+    yolo_model_path: Optional[str] = None
+    yolo_confidence: float = 0.5
+    pot_roi: Optional[tuple[int, int, int, int]] = None
+    bet_roi: Optional[tuple[int, int, int, int]] = None
+    pot_ocr_confidence: float = 0.6
+    pot_ocr_enabled: bool = True
 
     # Blackjack
     num_decks: int = 6
@@ -125,6 +137,9 @@ class AppConfig:
     hud_position: tuple[int, int] = (100, 100)
     hud_opacity: float = 0.85
 
+    # Poker
+    num_opponents: int = 1
+
     # Hotkeys
     hotkey_toggle_hud: str = "<ctrl>+<shift>+h"
     hotkey_calibrate: str = "<ctrl>+<shift>+c"
@@ -133,6 +148,10 @@ class AppConfig:
     hotkey_switch_mode: str = "<ctrl>+<shift>+s"
     hotkey_reset_shoe: str = "<ctrl>+<shift>+n"  # "New shoe"
     hotkey_poker_input: str = "<ctrl>+<shift>+p"
+    hotkey_settings: str = "<ctrl>+<shift>+o"
+
+    # Session logging
+    session_logging: bool = True
 
     @classmethod
     def load(cls, path: str | Path) -> "AppConfig":
@@ -147,7 +166,7 @@ class AppConfig:
             cfg = cls()
             for key, value in data.items():
                 if hasattr(cfg, key):
-                    if key in ("capture_region", "hud_position") and isinstance(value, list):
+                    if key in ("capture_region", "hud_position", "pot_roi", "bet_roi") and isinstance(value, list):
                         value = tuple(value)
                     setattr(cfg, key, value)
             return cfg
@@ -190,6 +209,39 @@ def _parse_card(card_str: str) -> Optional[Card]:
 
 
 # ---------------------------------------------------------------------------
+# Poker state fingerprinting (skip redundant analyze/HUD on unchanged ticks)
+# ---------------------------------------------------------------------------
+
+def _poker_equity_hash(state: PokerState) -> tuple:
+    """Hashable fingerprint of fields that affect Monte Carlo equity."""
+    return (
+        tuple(state.hole_cards),
+        tuple(state.community_cards),
+        state.num_opponents,
+    )
+
+
+def _poker_full_hash(state: PokerState) -> tuple:
+    """Full fingerprint including pot/bet fields that affect EV only."""
+    return (
+        *_poker_equity_hash(state),
+        state.pot_size,
+        state.bet_to_call,
+    )
+
+
+def _detection_meta_fingerprint(meta: Optional[DetectionMeta]) -> Optional[tuple]:
+    """Hashable fingerprint for vision confidence metadata shown on the HUD."""
+    if meta is None:
+        return None
+    return (
+        meta.overall_confidence,
+        frozenset(meta.card_confidences.items()),
+        meta.is_manual,
+    )
+
+
+# ---------------------------------------------------------------------------
 # GameController
 # ---------------------------------------------------------------------------
 
@@ -208,14 +260,24 @@ class GameController:
         capture: ScreenCapture,
         template_engine: TemplateEngine,
         overlay: Optional["HUDOverlay"],
+        pot_ocr: Optional[PotOCR] = None,
+        yolo_engine: Optional[YOLOEngine] = None,
+        session_logger: Optional[SessionLogger] = None,
+        config_path: Optional[str | Path] = None,
     ) -> None:
         self.config = config
+        self._config_path = Path(config_path) if config_path is not None else None
         self.capture = capture
         self.template_engine = template_engine
         self.overlay = overlay
+        self.pot_ocr = pot_ocr
+        self.yolo_engine = yolo_engine
+        self._session_logger = session_logger or SessionLogger(
+            enabled=config.session_logging,
+        )
 
         # Game state
-        self.poker_state = PokerState()
+        self.poker_state = PokerState(num_opponents=config.num_opponents)
         self.blackjack_state = BlackjackState(num_decks=config.num_decks)
         self.mode = GameMode(config.game_mode) if config.game_mode in [m.value for m in GameMode] else GameMode.POKER
 
@@ -223,15 +285,25 @@ class GameController:
         self._last_poker_result = PokerResult()
         self._last_bj_result = BlackjackResult()
 
+        # Poker tick cache — split equity vs pot/bet for fast EV-only updates
+        self._last_equity_hash: Optional[tuple] = None
+        self._last_full_hash: Optional[tuple] = None
+        self._last_detection_meta_fingerprint: Optional[tuple] = None
+
         # Frame-skip: only run expensive template matching when the frame
-        # has changed significantly.  Stores a downsampled grayscale hash
-        # of the previous frame.
-        self._prev_frame_hash: Optional[float] = None
-        self._frame_change_threshold: float = 5.0  # Mean pixel diff threshold
+        # has changed significantly.  Stores a downsampled grayscale snapshot.
+        self._prev_frame_gray: Optional["np.ndarray"] = None
+        self._frame_change_threshold: float = 5.0  # Mean absolute pixel diff
         self._detect_every_n: int = 3  # Run detection at most every N ticks
 
         # Detection confidence metadata
         self._detection_meta: Optional[DetectionMeta] = None
+
+        # Manual pot/bet input overrides OCR until the hand is reset.
+        self._poker_values_manual: bool = False
+
+        # Cross-frame YOLO deduplication for blackjack card counting
+        self._card_tracker = CardTracker()
 
         # Stats
         self._frame_count: int = 0
@@ -251,8 +323,10 @@ class GameController:
             5. Push result to HUD.
 
         In blackjack mode:
-            1. Run blackjack math on current state (cards come from manual input).
-            2. Push result to HUD.
+            1. When YOLO is available, detect cards from the latest frame.
+            2. Otherwise cards come from manual input only.
+            3. Run blackjack math on current state.
+            4. Push result to HUD.
         """
         self._frame_count += 1
 
@@ -283,33 +357,92 @@ class GameController:
             if detections:
                 self._apply_poker_detections(detections)
 
-        result = analyze_poker(self.poker_state)
-        result.detection_meta = self._detection_meta
-        self._last_poker_result = result
+            # Gate pot OCR on card hash — only read pot/bet once hole cards exist.
+            if (
+                self.pot_ocr is not None
+                and self.config.pot_ocr_enabled
+                and not self._poker_values_manual
+                and len(self.poker_state.hole_cards) >= 2
+            ):
+                self._apply_pot_ocr(frame)
+
+        equity_hash = _poker_equity_hash(self.poker_state)
+        full_hash = _poker_full_hash(self.poker_state)
+        meta_fingerprint = _detection_meta_fingerprint(self._detection_meta)
+        equity_changed = equity_hash != self._last_equity_hash
+        pot_changed = full_hash != self._last_full_hash
+        meta_changed = meta_fingerprint != self._last_detection_meta_fingerprint
+        is_first_tick = self._last_equity_hash is None
+
+        if equity_changed or is_first_tick:
+            result = analyze_poker(self.poker_state)
+            result.detection_meta = self._detection_meta
+            self._last_poker_result = result
+            self._last_equity_hash = equity_hash
+            self._last_full_hash = full_hash
+            self._last_detection_meta_fingerprint = meta_fingerprint
+        elif pot_changed:
+            result = recompute_poker_ev(
+                self._last_poker_result.win_pct,
+                self._last_poker_result.tie_pct,
+                self.poker_state.pot_size,
+                self.poker_state.bet_to_call,
+            )
+            result.detection_meta = self._detection_meta
+            self._last_poker_result = result
+            self._last_full_hash = full_hash
+            self._last_detection_meta_fingerprint = meta_fingerprint
+        elif meta_changed:
+            self._last_poker_result.detection_meta = self._detection_meta
+            self._last_detection_meta_fingerprint = meta_fingerprint
+        else:
+            return
+
+        self._session_logger.log_poker(self.poker_state, self._last_poker_result)
 
         if self.overlay is not None:
-            self.overlay.update_poker(result)
+            self.overlay.update_poker(self._last_poker_result)
 
     def _frame_changed(self, frame: "np.ndarray") -> bool:
         """Return True if *frame* differs enough from the previous to warrant re-detection."""
         try:
             import cv2
             small = cv2.resize(frame, (64, 48))
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(float)
-            current_hash = gray.mean()
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-            if self._prev_frame_hash is None:
-                self._prev_frame_hash = current_hash
+            if self._prev_frame_gray is None:
+                self._prev_frame_gray = gray
                 return True
 
-            delta = abs(current_hash - self._prev_frame_hash)
-            self._prev_frame_hash = current_hash
-            return delta > self._frame_change_threshold
+            diff = cv2.absdiff(gray, self._prev_frame_gray)
+            mean_diff = float(diff.mean())
+            self._prev_frame_gray = gray
+            return mean_diff > self._frame_change_threshold
         except Exception:
             return True  # If anything fails, run detection anyway
 
     def _tick_blackjack(self) -> None:
-        """Process one blackjack tick (state is updated via manual input)."""
+        """Process one blackjack tick.
+
+        Uses YOLO card detection when :attr:`yolo_engine` is loaded and
+        :attr:`~riverrater.vision.yolo_engine.YOLOEngine.is_available` is
+        ``True``; otherwise state is updated only via manual input.
+        """
+        if self.yolo_engine is not None and self.yolo_engine.is_available:
+            frame = self.capture.get_latest_frame()
+            should_detect = False
+
+            if frame is not None and self._frame_count % self._detect_every_n == 0:
+                should_detect = self._frame_changed(frame)
+
+            if should_detect and frame is not None:
+                detections = self.yolo_engine.detect_cards(
+                    frame,
+                    confidence=self.config.yolo_confidence,
+                )
+                if detections:
+                    self._apply_blackjack_detections(detections)
+
         result = analyze_blackjack(
             self.blackjack_state,
             min_bet=self.config.min_bet,
@@ -317,9 +450,52 @@ class GameController:
             bankroll=self.config.bankroll,
         )
         self._last_bj_result = result
+        self._session_logger.log_blackjack(self.blackjack_state, result)
 
         if self.overlay is not None:
             self.overlay.update_blackjack(result)
+
+    def _apply_blackjack_detections(
+        self,
+        detections: list[tuple[Card, tuple[int, int, int, int], float]],
+    ) -> None:
+        """Merge YOLO detections into blackjack state.
+
+        Cards are sorted top-to-bottom by bbox *y* (dealer upcard is typically
+        above the player hand on live-dealer layouts).  Cross-frame
+        :class:`~riverrater.vision.card_tracker.CardTracker` deduplication
+        ensures each physical card is added to ``cards_seen`` once, while
+        still counting duplicate rank/suit copies dealt to different positions
+        in a multi-deck shoe.
+        """
+        if not detections:
+            return
+
+        self._detection_meta = DetectionMeta.from_detections(detections)
+
+        new_detections = self._card_tracker.register_detections(detections)
+        for card, _bbox, _conf in new_detections:
+            self.blackjack_state.cards_seen.append(card)
+
+        sorted_dets = sorted(detections, key=lambda item: item[1][1])
+
+        if self.blackjack_state.dealer_upcard is None and sorted_dets:
+            self.blackjack_state.dealer_upcard = sorted_dets[0][0]
+            logger.debug(
+                "Dealer upcard from YOLO: %s",
+                self.blackjack_state.dealer_upcard,
+            )
+
+        for card, _bbox, _conf in sorted_dets[1:]:
+            if card not in self.blackjack_state.player_hand:
+                self.blackjack_state.player_hand.append(card)
+
+        logger.debug(
+            "Blackjack state — player: %s, dealer: %s, seen: %d",
+            [str(c) for c in self.blackjack_state.player_hand],
+            self.blackjack_state.dealer_upcard,
+            len(self.blackjack_state.cards_seen),
+        )
 
     def _apply_poker_detections(
         self,
@@ -349,6 +525,32 @@ class GameController:
             [str(c) for c in self.poker_state.hole_cards],
             [str(c) for c in self.poker_state.community_cards],
         )
+
+    def _apply_pot_ocr(self, frame: "np.ndarray") -> None:
+        """Update pot/bet fields from calibrated OCR regions when confident."""
+        pot_result, bet_result = self.pot_ocr.read_values(frame)
+        updated = False
+
+        if pot_result is not None:
+            self.poker_state.pot_size = pot_result.value
+            updated = True
+            logger.debug(
+                "Pot OCR: pot=%.2f (confidence=%.3f)",
+                pot_result.value,
+                pot_result.confidence,
+            )
+
+        if bet_result is not None:
+            self.poker_state.bet_to_call = bet_result.value
+            updated = True
+            logger.debug(
+                "Pot OCR: bet=%.2f (confidence=%.3f)",
+                bet_result.value,
+                bet_result.confidence,
+            )
+
+        if updated:
+            self._invalidate_poker_tick_cache()
 
     # ------------------------------------------------------------------
     # Manual card input (blackjack)
@@ -400,16 +602,43 @@ class GameController:
     # State management
     # ------------------------------------------------------------------
 
+    def _invalidate_poker_tick_cache(self) -> None:
+        """Force analyze_poker and HUD refresh on the next poker tick."""
+        self._last_equity_hash = None
+        self._last_full_hash = None
+        self._last_detection_meta_fingerprint = None
+
+    def _persist_num_opponents(self, num_opponents: int) -> None:
+        """Update config and save last opponent count when a path is configured."""
+        self.config.num_opponents = num_opponents
+        if self._config_path is not None:
+            self.config.save(self._config_path)
+
+    def set_num_opponents(self, num_opponents: int) -> None:
+        """Update active opponent count and force equity recalculation."""
+        clamped = max(1, min(9, int(num_opponents)))
+        if self.poker_state.num_opponents == clamped:
+            return
+        self.poker_state.num_opponents = clamped
+        self._persist_num_opponents(clamped)
+        self._invalidate_poker_tick_cache()
+        logger.info("Opponent count set to %d.", clamped)
+
     def reset_hand(self) -> None:
         """Clear current hand state for the active game mode."""
         if self.mode == GameMode.POKER:
-            self.poker_state = PokerState()
+            self.poker_state = PokerState(num_opponents=self.config.num_opponents)
+            self._poker_values_manual = False
+            clear_equity_cache()
+            self._invalidate_poker_tick_cache()
+            self._session_logger.reset_poker_cache()
             logger.info("Poker hand reset.")
         else:
             # Keep cards_seen (shoe memory) but clear the hand itself.
             seen = list(self.blackjack_state.cards_seen)
             self.blackjack_state = BlackjackState(num_decks=self.config.num_decks)
             self.blackjack_state.cards_seen = seen
+            self._session_logger.reset_blackjack_cache()
             logger.info("Blackjack hand reset (shoe memory preserved).")
 
     def reset_shoe(self) -> None:
@@ -418,6 +647,8 @@ class GameController:
         Use when the dealer shuffles a new shoe.
         """
         self.blackjack_state = BlackjackState(num_decks=self.config.num_decks)
+        self._card_tracker.reset()
+        self._session_logger.reset_blackjack_cache()
         logger.info("Shoe reset — all counts cleared.")
 
     def set_poker_values(self, pot_size: float, bet_to_call: float, num_opponents: int) -> None:
@@ -430,7 +661,10 @@ class GameController:
         """
         self.poker_state.pot_size = pot_size
         self.poker_state.bet_to_call = bet_to_call
-        self.poker_state.num_opponents = num_opponents
+        self.poker_state.num_opponents = max(1, min(9, int(num_opponents)))
+        self._poker_values_manual = True
+        self._persist_num_opponents(self.poker_state.num_opponents)
+        self._invalidate_poker_tick_cache()
         logger.info(
             "Poker values set: pot=%.2f, bet=%.2f, opp=%d",
             pot_size, bet_to_call, num_opponents,
@@ -560,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
     # -- HUD overlay ---------------------------------------------------------
     overlay: Optional[HUDOverlay] = None
     if _HAS_HUD and HUDOverlay is not None:
-        overlay = HUDOverlay()
+        overlay = HUDOverlay(num_opponents=config.num_opponents)
         overlay.set_position(*config.hud_position)
         overlay.set_opacity(config.hud_opacity)
         overlay.set_mode(GameMode(config.game_mode))
@@ -581,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
     capture.start()
 
     template_engine = TemplateEngine()
+    loaded_profile_path: Optional[Path] = None
     profile_paths = [
         Path(f"~/.riverrater/profiles/{config.vision_profile}.json").expanduser(),
         Path(f"/etc/riverrater/profiles/{config.vision_profile}.json"),
@@ -589,6 +824,7 @@ def main(argv: list[str] | None = None) -> int:
         if profile_path.exists():
             try:
                 template_engine.load_profile(str(profile_path))
+                loaded_profile_path = profile_path
                 logger.info("Loaded vision profile: %s", profile_path)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load vision profile %s: %s", profile_path, exc)
@@ -596,20 +832,155 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.info("No vision profile found — template engine running empty.")
 
+    pot_roi, bet_roi = resolve_pot_rois(
+        config.pot_roi,
+        config.bet_roi,
+        loaded_profile_path,
+    )
+    pot_ocr: Optional[PotOCR] = None
+    if config.pot_ocr_enabled and (pot_roi is not None or bet_roi is not None):
+        pot_ocr = PotOCR(
+            pot_roi=pot_roi,
+            bet_roi=bet_roi,
+            confidence_threshold=config.pot_ocr_confidence,
+        )
+        logger.info(
+            "Pot OCR enabled (pot_roi=%s, bet_roi=%s, threshold=%.2f)",
+            pot_roi,
+            bet_roi,
+            config.pot_ocr_confidence,
+        )
+
+    # -- YOLO engine (blackjack vision) --------------------------------------
+    yolo_weights = config.yolo_model_path or str(default_weights_path())
+    yolo_engine = YOLOEngine(yolo_weights)
+    if yolo_engine.is_available:
+        logger.info("YOLO engine ready (%s).", yolo_weights)
+    else:
+        logger.info(
+            "YOLO unavailable at %s — blackjack uses manual input fallback.",
+            yolo_weights,
+        )
+
     # -- Game controller -----------------------------------------------------
     controller = GameController(
         config=config,
         capture=capture,
         template_engine=template_engine,
         overlay=overlay,
+        pot_ocr=pot_ocr,
+        yolo_engine=yolo_engine,
+        config_path=config_path,
     )
 
     # -- Poker input dialog (for poker mode) ----------------------------------
     poker_input: Optional[PokerInputDialog] = None
     if _HAS_HUD and PokerInputDialog is not None:
-        poker_input = PokerInputDialog(overlay)
-        poker_input.values_submitted.connect(controller.set_poker_values)
+        poker_input = PokerInputDialog(overlay, num_opponents=config.num_opponents)
+
+        def _on_poker_values_submitted(
+            pot_size: float,
+            bet_to_call: float,
+            num_opponents: int,
+        ) -> None:
+            controller.set_poker_values(pot_size, bet_to_call, num_opponents)
+            if overlay is not None:
+                overlay.poker_view.set_num_opponents(
+                    controller.poker_state.num_opponents,
+                )
+
+        poker_input.values_submitted.connect(_on_poker_values_submitted)
         logger.debug("PokerInputDialog created.")
+
+    def _sync_opponent_count(count: int) -> None:
+        """Keep HUD stepper, dialog, and game state aligned."""
+        controller.set_num_opponents(count)
+        if overlay is not None:
+            overlay.poker_view.set_num_opponents(controller.poker_state.num_opponents)
+        if poker_input is not None:
+            poker_input.num_opponents = controller.poker_state.num_opponents
+
+    if overlay is not None:
+        overlay.poker_view.num_opponents_changed.connect(_sync_opponent_count)
+
+    # -- Settings dialog ------------------------------------------------------
+    settings_dialog: Optional[SettingsDialog] = None
+
+    def _apply_settings(updated: AppConfig) -> None:
+        nonlocal pot_ocr, yolo_engine, loaded_profile_path
+
+        config.__dict__.update(updated.__dict__)
+
+        if overlay is not None:
+            overlay.set_opacity(config.hud_opacity)
+            overlay.set_position(*config.hud_position)
+
+        with capture._frame_lock:
+            capture._region = config.capture_region
+
+        if controller.blackjack_state.num_decks != config.num_decks:
+            controller.blackjack_state.num_decks = config.num_decks
+
+        profile_paths = [
+            Path(f"~/.riverrater/profiles/{config.vision_profile}.json").expanduser(),
+            Path(f"/etc/riverrater/profiles/{config.vision_profile}.json"),
+        ]
+        for profile_path in profile_paths:
+            if profile_path.exists():
+                try:
+                    template_engine.load_profile(str(profile_path))
+                    loaded_profile_path = profile_path
+                    logger.info("Reloaded vision profile: %s", profile_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to reload vision profile %s: %s",
+                        profile_path,
+                        exc,
+                    )
+                break
+
+        pot_roi, bet_roi = resolve_pot_rois(
+            config.pot_roi,
+            config.bet_roi,
+            loaded_profile_path,
+        )
+        if config.pot_ocr_enabled and (pot_roi is not None or bet_roi is not None):
+            pot_ocr = PotOCR(
+                pot_roi=pot_roi,
+                bet_roi=bet_roi,
+                confidence_threshold=config.pot_ocr_confidence,
+            )
+            controller.pot_ocr = pot_ocr
+            logger.info("Pot OCR reconfigured from settings.")
+        else:
+            pot_ocr = None
+            controller.pot_ocr = None
+            logger.info("Pot OCR disabled from settings.")
+
+        yolo_weights = config.yolo_model_path or str(default_weights_path())
+        new_yolo = YOLOEngine(yolo_weights)
+        if new_yolo.is_available:
+            yolo_engine = new_yolo
+            controller.yolo_engine = yolo_engine
+            logger.info("YOLO engine reconfigured from settings (%s).", yolo_weights)
+        elif yolo_engine is None:
+            controller.yolo_engine = new_yolo
+            logger.info(
+                "YOLO unavailable at %s — blackjack uses manual input fallback.",
+                yolo_weights,
+            )
+        else:
+            logger.warning(
+                "YOLO unavailable at %s — keeping previous engine.",
+                yolo_weights,
+            )
+
+        logger.info("Settings applied.")
+
+    if _HAS_HUD and SettingsDialog is not None:
+        settings_dialog = SettingsDialog(config, config_path, overlay)
+        settings_dialog.settings_saved.connect(_apply_settings)
+        logger.debug("SettingsDialog created.")
 
     # -- Manual card input signal connection ---------------------------------
     if manual_input is not None:
@@ -686,6 +1057,26 @@ def main(argv: list[str] | None = None) -> int:
             QMetaObject.invokeMethod(poker_input, "raise_", Qt.ConnectionType.QueuedConnection)
             QMetaObject.invokeMethod(poker_input, "activateWindow", Qt.ConnectionType.QueuedConnection)
 
+    def _show_settings() -> None:
+        if settings_dialog is not None:
+            def _open_on_main_thread() -> None:
+                settings_dialog.load_from_config(config)
+                settings_dialog.show()
+                settings_dialog.raise_()
+                settings_dialog.activateWindow()
+
+            QTimer.singleShot(0, _open_on_main_thread)
+
+    def _on_degradation_fix(action: str) -> None:
+        """Route degradation Fix button to calibration or manual poker input."""
+        if action == "poker_input":
+            _show_poker_input()
+        else:
+            _calibrate()
+
+    if overlay is not None:
+        overlay.poker_view.degradation_fix_requested.connect(_on_degradation_fix)
+
     hotkeys.register(config.hotkey_toggle_hud, _toggle_hud)
     hotkeys.register(config.hotkey_calibrate, _calibrate)
     hotkeys.register(config.hotkey_manual_card, _show_manual_input)
@@ -697,10 +1088,12 @@ def main(argv: list[str] | None = None) -> int:
     hotkeys.register(config.hotkey_switch_mode, _switch_mode)
     hotkeys.register(config.hotkey_reset_shoe, _reset_shoe)
     hotkeys.register(config.hotkey_poker_input, _show_poker_input)
+    hotkeys.register(config.hotkey_settings, _show_settings)
     hotkeys.start()
 
     logger.info(
-        "Hotkeys registered: toggle=%s, calibrate=%s, manual=%s, reset=%s, switch=%s, shoe=%s, poker_input=%s",
+        "Hotkeys registered: toggle=%s, calibrate=%s, manual=%s, reset=%s, "
+        "switch=%s, shoe=%s, poker_input=%s, settings=%s",
         config.hotkey_toggle_hud,
         config.hotkey_calibrate,
         config.hotkey_manual_card,
@@ -708,6 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
         config.hotkey_switch_mode,
         config.hotkey_reset_shoe,
         config.hotkey_poker_input,
+        config.hotkey_settings,
     )
 
     # -- Processing timer (30fps) -------------------------------------------

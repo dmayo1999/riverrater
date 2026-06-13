@@ -172,8 +172,8 @@ class CalibrationSession:
     """
 
     def __init__(self) -> None:
-        # Each entry: (Card, roi: np.ndarray)
-        self._pending: list[tuple[Card, np.ndarray]] = []
+        # Each entry: (Card, roi image, bbox in frame coordinates)
+        self._pending: list[tuple[Card, np.ndarray, tuple[int, int, int, int]]] = []
         self._capture = CalibrationCapture()
         self._active = True
 
@@ -213,7 +213,7 @@ class CalibrationSession:
         card = self.parse_card_string(card_str)
         x, y, w, h = bbox
         roi = self._capture.get_roi(frame, x, y, w, h)
-        self._pending.append((card, roi))
+        self._pending.append((card, roi, (x, y, w, h)))
         logger.debug("Queued calibration for %s (%d pending).", card, len(self._pending))
 
     # ------------------------------------------------------------------ #
@@ -312,9 +312,17 @@ class CalibrationSession:
                 f"got: {type(template_engine)!r}"
             )
 
-        for card, roi in self._pending:
+        slot_regions: list[tuple[int, int, int, int]] = []
+        seen_regions: set[tuple[int, int, int, int]] = set()
+        for card, roi, bbox in self._pending:
             template_engine.add_template(card, roi)
+            if bbox not in seen_regions:
+                seen_regions.add(bbox)
+                slot_regions.append(bbox)
             logger.info("Applied calibration for %s to engine.", card)
+
+        if slot_regions and hasattr(template_engine, "set_roi_regions"):
+            template_engine.set_roi_regions(slot_regions)
 
         count = len(self._pending)
         self._pending.clear()
